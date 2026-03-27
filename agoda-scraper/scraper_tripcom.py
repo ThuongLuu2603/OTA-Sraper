@@ -508,12 +508,36 @@ def _find_hotel_list_in_json(data) -> list:
     return []
 
 
-def _find_page_key_in_body(body_obj: dict) -> tuple[str, int]:
-    """Return (key_name, current_page_value) for the pagination key in a request body."""
-    for key in ("pageIndex", "pageNum", "page", "pageNo", "currentPage"):
+def _find_page_key_in_body(body_obj: dict, _depth: int = 0) -> tuple[str, int]:
+    """Return (key_name, current_page_value) for the pagination key in a request body.
+    Searches recursively into nested dicts (e.g. htlsRequest.pageIndex)."""
+    if _depth > 4:
+        return "", 0
+    PAGE_KEYS = ("pageIndex", "pageNum", "page", "pageNo", "currentPage")
+    for key in PAGE_KEYS:
         if key in body_obj:
             return key, body_obj[key]
+    # Recurse into nested dicts
+    for key, val in body_obj.items():
+        if isinstance(val, dict):
+            result = _find_page_key_in_body(val, _depth + 1)
+            if result[0]:
+                return result
     return "", 0
+
+
+def _set_page_key_in_body(body_obj: dict, target_key: str, new_val: int, _depth: int = 0) -> bool:
+    """Set the page key (found by _find_page_key_in_body) to new_val recursively."""
+    if _depth > 4:
+        return False
+    if target_key in body_obj:
+        body_obj[target_key] = new_val
+        return True
+    for val in body_obj.values():
+        if isinstance(val, dict):
+            if _set_page_key_in_body(val, target_key, new_val, _depth + 1):
+                return True
+    return False
 
 
 def _hotels_from_api_list(items: list, destination: str) -> list[dict]:
@@ -704,11 +728,17 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
         if api_cap.get("ready"):
             method = api_cap.get("method", "POST")
             has_body = bool(api_cap.get("body_str"))
+            url_preview = api_cap["url"][:90]
+            body_preview = (api_cap.get("body_str") or "")[:80]
+            # Pre-detect pagination key so we can log it
+            body_obj_preview = _json.loads(api_cap["body_str"]) if api_cap.get("body_str") else {}
+            pg_key_preview, pg_val_preview = _find_page_key_in_body(body_obj_preview)
             status_callback(
-                f"🔗 API ({method}, body={has_body}) — "
-                f"{len(api_cap['first_list'])} hotels/page — "
+                f"🔗 API ({method}) — {len(api_cap['first_list'])} hotels/page — "
                 f"total={total_hotels or '?'}"
             )
+            status_callback(f"  🔍 URL: {url_preview}")
+            status_callback(f"  🔍 pgKey='{pg_key_preview}' pgVal={pg_val_preview} | body: {body_preview}")
         else:
             status_callback("⚠️ Không bắt được API, thử click next-page...")
 
@@ -754,14 +784,16 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
                             return await r.text();
                         }}"""
                     else:
-                        # POST request: modify pageIndex in body
+                        # POST request: modify pageIndex in body (recursive search)
                         body_obj = _json.loads(api_cap["body_str"])
                         pg_key, pg_val = _find_page_key_in_body(body_obj)
+                        new_pg_val = (pg - 1) if pg_val == 0 else pg
                         if pg_key:
-                            body_obj[pg_key] = (pg - 1) if pg_val == 0 else pg
+                            _set_page_key_in_body(body_obj, pg_key, new_pg_val)
                         else:
-                            body_obj["pageIndex"] = pg - 1
+                            body_obj["pageIndex"] = new_pg_val
                         new_body = _json.dumps(body_obj)
+                        status_callback(f"  🔍 POST pgKey={pg_key!r} → {new_pg_val}")
                         fetch_js = f"""async () => {{
                             const r = await fetch({_json.dumps(api_url)}, {{
                                 method: 'POST',
@@ -772,6 +804,7 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
                             return await r.text();
                         }}"""
 
+                    await asyncio.sleep(1.0)  # polite rate-limit delay
                     raw_text = await page.evaluate(fetch_js)
                     api_data = _json.loads(raw_text)
                     hotel_list = _find_hotel_list_in_json(api_data)
@@ -786,20 +819,21 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
                         else:
                             # Same hotels returned — likely end of pagination
                             consecutive_empty += 1
-                            if consecutive_empty >= 2:
+                            status_callback(f"  ⚠️ 0 hotel mới (lần {consecutive_empty}), snippet: {raw_text[:150]}")
+                            if consecutive_empty >= 3:
                                 status_callback("⚠️ API liên tục trả hotel đã có, dừng.")
                                 break
                     else:
-                        status_callback(f"  ⚠️ API trả về rỗng/lỗi (snippet: {raw_text[:120]})")
+                        status_callback(f"  ⚠️ Rỗng (lần {consecutive_empty+1}): {raw_text[:200]}")
                         consecutive_empty += 1
-                        if consecutive_empty >= 2:
-                            status_callback("⚠️ API rỗng 2 lần, dừng.")
+                        if consecutive_empty >= 3:
+                            status_callback("⚠️ API rỗng 3 lần liên tiếp, dừng.")
                             break
 
                 except Exception as e:
-                    status_callback(f"  ⚠️ API lỗi: {str(e)[:100]}")
+                    status_callback(f"  ⚠️ API lỗi: {str(e)[:120]}")
                     consecutive_empty += 1
-                    if consecutive_empty >= 3:
+                    if consecutive_empty >= 4:
                         break
 
             # ── Strategy B: click next-page button ──────────────────────────
