@@ -248,44 +248,38 @@ async def _extract_page_hotels(page, destination: str) -> list[dict]:
     return hotels
 
 
-async def _get_total_pages(page) -> int:
-    """Try to detect number of pages from pagination."""
+def _make_page_url(base_url: str, page_num: int) -> str:
+    """Build URL for a specific page number by setting the page= param."""
+    url = re.sub(r'([?&])page=\d+', '', base_url).rstrip('&').rstrip('?')
+    sep = '&' if '?' in url else '?'
+    if page_num == 1:
+        return url
+    return f"{url}{sep}page={page_num}"
+
+
+async def _detect_total_hotels(page) -> int:
+    """Detect total hotel count from visible page text."""
     try:
-        # Trip.com shows "Page X of Y" or similar
         body = await page.inner_text("body")
-        m = re.search(r'(\d+)\s*(?:khách sạn|hotel)', body, re.IGNORECASE)
-        if m:
-            total_hotels = int(m.group(1))
-            return max(1, (total_hotels + 9) // 10)
+        # Trip.com VN shows: "123 khách sạn", "456 hotels", or "Tìm thấy 789"
+        for pattern in [
+            r'(?:Tìm thấy|tổng)\s+([\d,\.]+)\s*(?:khách sạn|hotel)',
+            r'([\d,\.]+)\s+(?:khách sạn|kết quả|hotel)',
+            r'(?:khách sạn|hotel)[^\d]*([\d,\.]+)',
+        ]:
+            m = re.search(pattern, body, re.IGNORECASE)
+            if m:
+                raw = m.group(1).replace(',', '').replace('.', '')
+                n = int(raw)
+                if 1 <= n <= 5000:
+                    return n
     except Exception:
         pass
-    return 5  # default: try up to 5 pages
-
-
-async def _go_next_page(page) -> bool:
-    """Click the next page button. Returns True if successful."""
-    try:
-        next_btn_selectors = [
-            "[class*='pagination'] [class*='next']:not([disabled])",
-            "[class*='next-page']:not([disabled])",
-            "button[aria-label*='next']:not([disabled])",
-            "[class*='pagination'] li:last-child a",
-        ]
-        for sel in next_btn_selectors:
-            el = await page.query_selector(sel)
-            if el:
-                is_disabled = await el.get_attribute("disabled")
-                if is_disabled is None:
-                    await el.click()
-                    await asyncio.sleep(3)
-                    return True
-    except Exception:
-        pass
-    return False
+    return 0
 
 
 # ---------------------------------------------------------------------------
-# Main scrape runner
+# Main scrape runner — URL-based pagination (more reliable than clicking buttons)
 # ---------------------------------------------------------------------------
 
 async def _scrape_async(url: str, destination: str, status_callback) -> list[dict]:
@@ -293,7 +287,14 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
     if not chromium:
         raise RuntimeError("Không tìm thấy Chromium. Vui lòng cài đặt.")
 
+    # Ensure VND currency in URL
+    if 'curr=' not in url and 'barCurr=' not in url:
+        sep = '&' if '?' in url else '?'
+        url = f"{url}{sep}curr=VND&locale=vi-VN"
+
     results = []
+    seen_links: set[str] = set()
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
@@ -309,44 +310,81 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
         page = await ctx.new_page()
 
         status_callback("🌐 Đang mở trang Trip.com...")
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=55000)
-        except PlaywrightTimeoutError:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page_num = 1
+        total_hotels = 0
+        hotels_per_page = 15  # Trip.com default; recalculated after page 1
 
-        await asyncio.sleep(5)
+        while True:
+            page_url = _make_page_url(url, page_num)
+            try:
+                await page.goto(page_url, wait_until="networkidle", timeout=55000)
+            except PlaywrightTimeoutError:
+                try:
+                    await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    status_callback(f"⚠️ Không thể tải trang {page_num}, dừng.")
+                    break
 
-        # Scroll to trigger lazy loading
-        for _ in range(4):
-            await page.evaluate("window.scrollBy(0, 600)")
+            await asyncio.sleep(4)
+
+            # Scroll to trigger lazy loading
+            for _ in range(5):
+                await page.evaluate("window.scrollBy(0, 700)")
+                await asyncio.sleep(0.8)
             await asyncio.sleep(1)
 
-        # Detect total pages
-        total_pages = await _get_total_pages(page)
-        total_pages = min(total_pages, 20)  # cap at 20 pages
-        status_callback(f"📄 Phát hiện ~{total_pages} trang. Bắt đầu thu thập...")
+            # On first page: detect total hotel count
+            if page_num == 1:
+                total_hotels = await _detect_total_hotels(page)
+                if total_hotels:
+                    status_callback(f"📊 Trip.com báo tổng {total_hotels} khách sạn. Bắt đầu thu thập...")
+                else:
+                    status_callback("📄 Bắt đầu thu thập (không phát hiện được tổng số)...")
 
-        seen_ids: set[str] = set()
-        for page_num in range(1, total_pages + 1):
             hotels = await _extract_page_hotels(page, destination)
-
-            # Deduplicate
-            new = [h for h in hotels if h["Link khách sạn"] not in seen_ids]
+            new = [h for h in hotels if h["Link khách sạn"] not in seen_links]
             for h in new:
-                seen_ids.add(h["Link khách sạn"])
+                if h["Link khách sạn"]:
+                    seen_links.add(h["Link khách sạn"])
             results.extend(new)
 
-            status_callback(f"📄 Trang {page_num}/{total_pages} — {len(new)} khách sạn — Tổng: {len(results)}")
+            status_callback(f"📄 Trang {page_num} — +{len(new)} mới — Tổng: {len(results)}")
 
-            if page_num < total_pages:
-                went = await _go_next_page(page)
-                if not went:
-                    status_callback("⚠️ Không tìm thấy nút trang tiếp theo, dừng.")
-                    break
+            # Recalculate hotels_per_page from first non-empty result
+            if page_num == 1 and hotels:
+                hotels_per_page = max(len(hotels), 10)
+
+            # Stop conditions
+            if len(new) == 0:
+                # Try once more after extra wait (sometimes lazy-loading is slow)
                 await asyncio.sleep(3)
-                for _ in range(4):
-                    await page.evaluate("window.scrollBy(0, 600)")
-                    await asyncio.sleep(1)
+                hotels2 = await _extract_page_hotels(page, destination)
+                new2 = [h for h in hotels2 if h["Link khách sạn"] not in seen_links]
+                if not new2:
+                    status_callback("⚠️ Trang không có khách sạn mới, dừng phân trang.")
+                    break
+                for h in new2:
+                    if h["Link khách sạn"]:
+                        seen_links.add(h["Link khách sạn"])
+                results.extend(new2)
+                status_callback(f"  → Retry: +{len(new2)} mới (tổng: {len(results)})")
+
+            # Check if we've collected enough based on total
+            if total_hotels and len(results) >= total_hotels:
+                status_callback(f"✅ Đã thu thập đủ {len(results)} khách sạn.")
+                break
+
+            # Estimate if more pages remain
+            estimated_total_pages = max(1, (total_hotels + hotels_per_page - 1) // hotels_per_page) if total_hotels else 50
+            if page_num >= estimated_total_pages:
+                break
+
+            # Safety cap
+            if len(results) >= 2000 or page_num >= 50:
+                status_callback("⚠️ Đã đạt giới hạn, dừng.")
+                break
+
+            page_num += 1
 
         await browser.close()
 
