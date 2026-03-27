@@ -48,6 +48,16 @@ Every package extends `tsconfig.base.json` which sets `composite: true`. The roo
 - `pnpm run build` — runs `typecheck` first, then recursively runs `build` in all packages that define it
 - `pnpm run typecheck` — runs `tsc --build --emitDeclarationOnly` using project references
 
+## Agoda Scraper (Python/Streamlit)
+
+Standalone Python app at `agoda-scraper/` for scraping hotel data from Agoda.
+
+- `app.py` — Streamlit UI with 2-tab input (form + direct URL), preview table, Excel/CSV download
+- `scraper.py` — Playwright-based async scraper with auto-scroll, random User-Agent, random delays
+- `.streamlit/config.toml` — Streamlit server config (port 5000)
+- `requirements.txt` — Python dependencies
+- Run via workflow "Agoda Scraper": `cd agoda-scraper && streamlit run app.py --server.port 5000`
+
 ## Packages
 
 ### `artifacts/api-server` (`@workspace/api-server`)
