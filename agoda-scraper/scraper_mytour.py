@@ -397,16 +397,39 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
                                    province_fragments: list[str],
                                    status_callback) -> list[dict]:
     """
-    Fallback / paste-URL mode:
-    Navigate to the provided URL, intercept availability API responses,
-    optionally filter by province name fragments.
+    Paste-URL mode:
+    1. Navigate to the pasted URL to capture apphash (from request headers)
+       and province_id (from first API response item).
+    2. Parse guest params (adults, rooms, children, dates) from the URL.
+    3. Then paginate through ALL pages via direct API calls (same as _scrape_async).
     """
+    import json as _json
+    import math
+    from urllib.parse import urlparse, parse_qs
+
     chromium = get_chromium_path()
     if not chromium:
         raise RuntimeError("Không tìm thấy Chromium.")
 
-    results: list[dict] = []
-    seen_ids: set = set()
+    # Parse guest params + dates from the pasted URL
+    try:
+        parsed_url = urlparse(direct_url)
+        params = parse_qs(parsed_url.query)
+        url_checkin = params.get("checkIn", [""])[0]
+        url_checkout = params.get("checkOut", [""])[0]
+        url_adults = int(params.get("adults", ["2"])[0])
+        url_rooms = int(params.get("rooms", ["1"])[0])
+        url_children = int(params.get("children", ["0"])[0])
+    except Exception:
+        url_checkin = check_in
+        url_checkout = check_out
+        url_adults, url_rooms, url_children = 2, 1, 0
+
+    # Prefer dates from URL (Mytour uses DD-MM-YYYY)
+    effective_checkin = url_checkin or check_in
+    effective_checkout = url_checkout or check_out
+
+    discovered: dict = {}  # apphash, province_id, total
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -420,77 +443,139 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
         )
         page = await ctx.new_page()
 
-        import json as _json
+        async def on_request(request):
+            if "apis.tripi.vn" in request.url and "apphash" not in discovered:
+                h = request.headers
+                if h.get("apphash"):
+                    discovered["apphash"] = h["apphash"]
 
         async def on_response(response):
-            try:
-                if AVAILABILITY_URL in response.url and response.status == 200:
+            if AVAILABILITY_URL in response.url and response.status == 200 and "province_id" not in discovered:
+                try:
                     body = await response.text()
                     data = _json.loads(body)
-                    items = (data.get("data") or {}).get("items") or []
-                    for item in items:
-                        hid = item.get("id")
-                        if hid and hid not in seen_ids:
-                            addr = item.get("address") or {}
-                            prov = addr.get("provinceName") or ""
-                            dist = addr.get("districtName") or ""
-                            combined = f"{prov} {dist}"
-                            match = not province_fragments or any(
-                                f.lower() in combined.lower() for f in province_fragments
-                            )
-                            if match:
-                                seen_ids.add(hid)
-                                results.append(_extract_hotel(item, destination, check_in, check_out))
-            except Exception:
-                pass
+                    d = data.get("data") or {}
+                    items = d.get("items") or []
+                    total = d.get("total") or 0
+                    if items:
+                        addr = (items[0].get("address") or {})
+                        pid = addr.get("provinceId") or items[0].get("provinceId")
+                        if pid:
+                            discovered["province_id"] = int(pid)
+                            discovered["total"] = total
+                except Exception:
+                    pass
 
+        page.on("request", on_request)
         page.on("response", on_response)
 
-        status_callback(f"🌐 Đang mở trang Mytour (chế độ URL trực tiếp)...")
+        status_callback("🌐 Đang mở trang Mytour để phát hiện tỉnh thành và apphash...")
         try:
             await page.goto(direct_url, wait_until="networkidle", timeout=50000)
         except PlaywrightTimeoutError:
             await page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
 
-        await asyncio.sleep(6)
-        status_callback(f"📦 Trang 1 — {len(results)} khách sạn")
+        await asyncio.sleep(5)
 
-        # Scroll to trigger lazy-loaded cards
-        for _ in range(8):
-            await page.evaluate("window.scrollBy(0, 700)")
-            await asyncio.sleep(1.5)
+        apphash = discovered.get("apphash", "LnJCWsNPd7SMjCMm7dw5BlqIeoFiib3iUTjSC6rck6Y=")
+        province_id = discovered.get("province_id")
+        total_hint = discovered.get("total", 0)
 
-        status_callback(f"📦 Sau scroll — {len(results)} khách sạn")
+        if not province_id:
+            status_callback("❌ Không phát hiện được province_id từ URL này. Thử dùng tab cấu hình với tên tỉnh cụ thể.")
+            await browser.close()
+            return []
 
-        # Try to paginate
-        for page_num in range(2, 11):
-            before = len(results)
-            next_btn = None
-            for sel in [
-                "[class*='pagination'] [aria-label='Go to next page']",
-                "[class*='pagination'] button:last-child:not([disabled])",
-                "button[aria-label*='next']:not([disabled])",
-                "li.next:not(.disabled) a",
-            ]:
-                el = await page.query_selector(sel)
-                if el:
-                    is_disabled = await el.get_attribute("disabled")
-                    if is_disabled is None:
-                        next_btn = el
-                        break
+        status_callback(f"✅ Phát hiện province_id={province_id}, tổng ~{total_hint} khách sạn. Bắt đầu thu thập toàn bộ...")
 
-            if not next_btn:
+        # --- Paginate via direct API calls (same as _scrape_async) ---
+        results: list[dict] = []
+        seen_ids: set = set()
+        total_pages = max(1, math.ceil(total_hint / PAGE_SIZE)) if total_hint else 99
+        current_page = 1
+
+        while current_page <= total_pages:
+            status_callback(f"📄 Đang tải trang {current_page}/{total_pages if total_hint else '?'}...")
+
+            api_result = await page.evaluate(f"""async () => {{
+                try {{
+                    const resp = await fetch('{AVAILABILITY_URL}', {{
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'appid': 'mytour-web',
+                            'deviceinfo': 'PC-Web',
+                            'lang': 'vi',
+                            'currency': 'VND',
+                            'countrycode': 'VN',
+                            'caid': '17',
+                            'platform': 'website',
+                            'apphash': '{apphash}',
+                            'version': '1.0',
+                            'origin': 'https://www.mytour.vn',
+                            'referer': '{direct_url}'
+                        }},
+                        body: JSON.stringify({{
+                            checkIn: '{effective_checkin}',
+                            checkOut: '{effective_checkout}',
+                            adults: {url_adults},
+                            rooms: {url_rooms},
+                            children: {url_children},
+                            page: {current_page},
+                            size: {PAGE_SIZE},
+                            useBasePrice: true,
+                            provinceId: {province_id}
+                        }})
+                    }});
+                    return await resp.json();
+                }} catch(e) {{
+                    return {{error: e.message}};
+                }}
+            }}""")
+
+            if api_result.get("error"):
+                status_callback(f"❌ Lỗi API: {api_result['error']}")
                 break
 
-            await next_btn.click()
-            await asyncio.sleep(4)
-            for _ in range(4):
-                await page.evaluate("window.scrollBy(0, 600)")
-                await asyncio.sleep(1)
+            code = api_result.get("code")
+            if code == 3005:
+                status_callback("⚠️ IP bị chặn tạm thời, dừng phân trang.")
+                break
+            if code != 200:
+                status_callback(f"⚠️ API trả về code={code}, dừng.")
+                break
 
-            new_count = len(results) - before
-            status_callback(f"📄 Trang {page_num}: +{new_count} mới (tổng: {len(results)})")
-            if new_count == 0:
+            data = api_result.get("data") or {}
+            items = data.get("items") or []
+            total = data.get("total") or 0
+
+            if not items:
+                break
+
+            # Recalculate total pages from actual first response
+            if current_page == 1 and total:
+                total_pages = max(1, math.ceil(total / PAGE_SIZE))
+                status_callback(f"📊 Tổng cộng {total} khách sạn, {total_pages} trang")
+
+            new_count = 0
+            for item in items:
+                hid = item.get("id")
+                if hid and hid not in seen_ids:
+                    seen_ids.add(hid)
+                    results.append(_extract_hotel(item, destination, effective_checkin, effective_checkout))
+                    new_count += 1
+
+            status_callback(f"  → Trang {current_page}: +{new_count} khách sạn (tổng: {len(results)})")
+
+            if new_count == 0 or len(items) < PAGE_SIZE:
+                break
+
+            await asyncio.sleep(0.8)
+            current_page += 1
+
+            if len(results) >= 2000:
+                status_callback("⚠️ Đã đạt giới hạn 2000 khách sạn, dừng.")
                 break
 
         await browser.close()
