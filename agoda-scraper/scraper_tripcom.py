@@ -719,39 +719,33 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
 
         # Wait a bit for API interception to capture
         if not api_cap.get("ready"):
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
-        # Update total from API response if available (more reliable than DOM)
+        # Update total from API response (more reliable than DOM)
         if api_cap.get("api_total", 0) > total_hotels:
             total_hotels = api_cap["api_total"]
 
-        if api_cap.get("ready"):
-            method = api_cap.get("method", "POST")
-            has_body = bool(api_cap.get("body_str"))
-            url_preview = api_cap["url"][:90]
-            body_preview = (api_cap.get("body_str") or "")[:80]
-            # Pre-detect pagination key so we can log it
-            body_obj_preview = _json.loads(api_cap["body_str"]) if api_cap.get("body_str") else {}
-            pg_key_preview, pg_val_preview = _find_page_key_in_body(body_obj_preview)
-            status_callback(
-                f"🔗 API ({method}) — {len(api_cap['first_list'])} hotels/page — "
-                f"total={total_hotels or '?'}"
-            )
-            status_callback(f"  🔍 URL: {url_preview}")
-            status_callback(f"  🔍 pgKey='{pg_key_preview}' pgVal={pg_val_preview} | body: {body_preview}")
-        else:
-            status_callback("⚠️ Không bắt được API, thử click next-page...")
-
-        # ── Determine total pages (generous cap — stop via empty API response) ──
-        page_size = max(len(p1_hotels), 10) if p1_hotels else 25
+        # Determine total pages
+        page_size = max(len(p1_hotels), 8) if p1_hotels else 25
         if total_hotels >= 10:
             total_pages = math.ceil(total_hotels / page_size)
         else:
-            total_pages = 80  # loop until API says empty
+            total_pages = 50
         total_pages = min(total_pages, 80)
-        status_callback(f"📊 Ước tính {total_pages} trang × ~{page_size} hotels")
+        status_callback(f"📊 ~{total_hotels or '?'} khách sạn, {total_pages} trang × ~{page_size}")
 
-        # ── Pages 2+ ─────────────────────────────────────────────────────────
+        # ── Build page-N URL from the base URL (two naming conventions) ──────
+        def _make_page_url(base: str, pg_num: int) -> str:
+            """Return URL for page pg_num (1-indexed). Tries &pageIndex= (0-based)."""
+            clean = re.sub(r'[?&]pageIndex=\d+', '', base)
+            clean = re.sub(r'[?&]page=\d+', '', clean).rstrip("&?")
+            sep = "&" if "?" in clean else "?"
+            return f"{clean}{sep}pageIndex={pg_num - 1}"
+
+        # ── Pages 2+ via BROWSER NAVIGATION ─────────────────────────────────
+        # Navigate the browser to each page URL so Trip.com fires a fresh,
+        # authenticated API request that we capture in on_response.
+        # This avoids replaying stale/blocked API calls.
         consecutive_empty = 0
 
         for pg in range(2, total_pages + 1):
@@ -759,101 +753,57 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
                 status_callback("⚠️ Đạt giới hạn 2000.")
                 break
 
-            status_callback(f"📄 Đang lấy trang {pg}/{total_pages}...")
-            got_new = False
+            status_callback(f"📄 Trang {pg}/{total_pages} — navigate...")
 
-            # ── Strategy A: replay API call ──────────────────────────────────
-            if api_cap.get("ready"):
+            # Slot to capture the fresh API for this page
+            pg_cap: dict = {}
+
+            async def on_resp_page(resp, _cap=pg_cap):
+                if _cap.get("done"):
+                    return
+                if resp.status != 200:
+                    return
+                ct = resp.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
                 try:
-                    method = api_cap["method"]
-                    api_url = api_cap["url"]
-                    hdr_json = _json.dumps(api_cap["headers"])
+                    body = await resp.text()
+                    if len(body) < 300:
+                        return
+                    data = _json.loads(body)
+                    hl = _find_hotel_list_in_json(data)
+                    if len(hl) >= 5:
+                        _cap["list"] = hl
+                        _cap["done"] = True
+                except Exception:
+                    pass
 
-                    if method == "GET" or not api_cap.get("body_str"):
-                        # GET request: modify pageIndex in URL query string
-                        pg_url = re.sub(r'[?&]pageIndex=\d+', '', api_url)
-                        pg_url = re.sub(r'[?&]page=\d+', '', pg_url).rstrip("&?")
-                        sep = "&" if "?" in pg_url else "?"
-                        pg_url = f"{pg_url}{sep}pageIndex={pg - 1}"
-                        fetch_js = f"""async () => {{
-                            const r = await fetch({_json.dumps(pg_url)}, {{
-                                method: 'GET',
-                                headers: {hdr_json},
-                                credentials: 'include'
-                            }});
-                            return await r.text();
-                        }}"""
-                    else:
-                        # POST request: modify pageIndex in body (recursive search)
-                        body_obj = _json.loads(api_cap["body_str"])
-                        pg_key, pg_val = _find_page_key_in_body(body_obj)
-                        new_pg_val = (pg - 1) if pg_val == 0 else pg
-                        if pg_key:
-                            _set_page_key_in_body(body_obj, pg_key, new_pg_val)
-                        else:
-                            body_obj["pageIndex"] = new_pg_val
-                        new_body = _json.dumps(body_obj)
-                        status_callback(f"  🔍 POST pgKey={pg_key!r} → {new_pg_val}")
-                        fetch_js = f"""async () => {{
-                            const r = await fetch({_json.dumps(api_url)}, {{
-                                method: 'POST',
-                                headers: {hdr_json},
-                                body: {_json.dumps(new_body)},
-                                credentials: 'include'
-                            }});
-                            return await r.text();
-                        }}"""
+            page.on("response", on_resp_page)
+            pg_url = _make_page_url(url, pg)
+            try:
+                await page.goto(pg_url, wait_until="domcontentloaded", timeout=30000)
+            except PlaywrightTimeoutError:
+                pass
+            # Give the SPA time to fire the hotel API
+            await asyncio.sleep(4)
+            page.remove_listener("response", on_resp_page)
 
-                    await asyncio.sleep(1.0)  # polite rate-limit delay
-                    raw_text = await page.evaluate(fetch_js)
-                    api_data = _json.loads(raw_text)
-                    hotel_list = _find_hotel_list_in_json(api_data)
+            if pg_cap.get("list"):
+                hotels_pg = _hotels_from_api_list(pg_cap["list"], destination)
+                added = _add_new(hotels_pg, results, seen_keys)
+                status_callback(f"  → API nav: {len(pg_cap['list'])} raw, +{added} mới (tổng: {len(results)})")
+            else:
+                # Fallback: extract from DOM
+                hotels_pg = await _scroll_and_extract(page, destination, status_callback, f"p{pg} ")
+                added = _add_new(hotels_pg, results, seen_keys)
+                status_callback(f"  → DOM: +{added} mới (tổng: {len(results)})")
 
-                    if hotel_list:
-                        hotels_api = _hotels_from_api_list(hotel_list, destination)
-                        added = _add_new(hotels_api, results, seen_keys)
-                        status_callback(f"  → API: {len(hotel_list)} raw, +{added} mới (tổng: {len(results)})")
-                        if added > 0:
-                            got_new = True
-                            consecutive_empty = 0
-                        else:
-                            # Same hotels returned — likely end of pagination
-                            consecutive_empty += 1
-                            status_callback(f"  ⚠️ 0 hotel mới (lần {consecutive_empty}), snippet: {raw_text[:150]}")
-                            if consecutive_empty >= 3:
-                                status_callback("⚠️ API liên tục trả hotel đã có, dừng.")
-                                break
-                    else:
-                        status_callback(f"  ⚠️ Rỗng (lần {consecutive_empty+1}): {raw_text[:200]}")
-                        consecutive_empty += 1
-                        if consecutive_empty >= 3:
-                            status_callback("⚠️ API rỗng 3 lần liên tiếp, dừng.")
-                            break
-
-                except Exception as e:
-                    status_callback(f"  ⚠️ API lỗi: {str(e)[:120]}")
-                    consecutive_empty += 1
-                    if consecutive_empty >= 4:
-                        break
-
-            # ── Strategy B: click next-page button ──────────────────────────
-            if not got_new and not api_cap.get("ready"):
-                clicked = await page.evaluate(NEXT_PAGE_JS)
-                if clicked:
-                    status_callback(f"  → Clicked: {clicked}")
-                    await asyncio.sleep(4)
-                    pg_hotels = await _scroll_and_extract(page, destination, status_callback, f"p{pg} ")
-                    added = _add_new(pg_hotels, results, seen_keys)
-                    status_callback(f"  → DOM: +{added} mới (tổng: {len(results)})")
-                    if added == 0:
-                        consecutive_empty += 1
-                        if consecutive_empty >= 2:
-                            status_callback("⚠️ Không có hotel mới, dừng.")
-                            break
-                    else:
-                        consecutive_empty = 0
-                else:
-                    status_callback("⚠️ Không tìm được next-page button, dừng.")
+            if added > 0:
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    status_callback("⚠️ 3 trang liên tiếp không có hotel mới, dừng.")
                     break
 
         await browser.close()
