@@ -1,7 +1,5 @@
 import streamlit as st
 import pandas as pd
-import threading
-import queue
 import io
 from datetime import date, timedelta
 from scraper import build_agoda_url, run_scrape
@@ -15,13 +13,7 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .main-header {
-        text-align: center;
-        padding: 1rem 0;
-    }
-    .stProgress > div > div > div > div {
-        background-color: #ff6b35;
-    }
+    .main-header { text-align: center; padding: 1rem 0; }
     .status-box {
         background-color: #f0f2f6;
         border-radius: 8px;
@@ -29,13 +21,6 @@ st.markdown("""
         font-size: 14px;
         color: #444;
         margin: 6px 0;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 10px;
-        padding: 20px;
-        color: white;
-        text-align: center;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -47,31 +32,17 @@ if "scrape_results" not in st.session_state:
     st.session_state.scrape_results = None
 if "is_scraping" not in st.session_state:
     st.session_state.is_scraping = False
-if "status_messages" not in st.session_state:
-    st.session_state.status_messages = []
 
 tab1, tab2 = st.tabs(["📋 Nhập cấu hình tìm kiếm", "🔗 Dán URL trực tiếp"])
 
 with tab1:
     st.subheader("Cấu hình tìm kiếm khách sạn")
-    col1, col2 = st.columns([2, 1])
 
-    with col1:
-        destination_form = st.text_input(
-            "🗺️ Tỉnh thành / Điểm đến",
-            placeholder="VD: Hà Nội, Đà Nẵng, Hội An, Phú Quốc...",
-            key="destination_form"
-        )
-
-    with col2:
-        max_hotels_form = st.number_input(
-            "📊 Số khách sạn tối đa",
-            min_value=10,
-            max_value=500,
-            value=50,
-            step=10,
-            key="max_hotels_form"
-        )
+    destination_form = st.text_input(
+        "🗺️ Tỉnh thành / Điểm đến",
+        placeholder="VD: Hà Nội, Đà Nẵng, Hội An, Phú Quốc...",
+        key="destination_form"
+    )
 
     col3, col4 = st.columns(2)
     with col3:
@@ -103,15 +74,8 @@ with tab1:
         st.markdown("**Độ tuổi từng trẻ em:**")
         age_cols = st.columns(min(num_children, 5))
         for i in range(num_children):
-            col_idx = i % 5
-            with age_cols[col_idx]:
-                age = st.number_input(
-                    f"Trẻ em {i+1}",
-                    min_value=0,
-                    max_value=17,
-                    value=5,
-                    key=f"child_age_{i}"
-                )
+            with age_cols[i % 5]:
+                age = st.number_input(f"Trẻ em {i+1}", min_value=0, max_value=17, value=5, key=f"child_age_{i}")
                 child_ages_form.append(age)
 
     if checkin_date >= checkout_date:
@@ -135,7 +99,7 @@ with tab1:
             st.code(url_preview, language="text")
 
     scrape_form = st.button(
-        "🚀 Bắt đầu Scraping",
+        "🚀 Bắt đầu Scraping — Lấy toàn bộ kết quả",
         disabled=btn_disabled_form or not destination_form or st.session_state.is_scraping,
         key="scrape_form_btn",
         use_container_width=True,
@@ -145,7 +109,6 @@ with tab1:
     if scrape_form and url_preview:
         st.session_state["active_url"] = url_preview
         st.session_state["active_destination"] = destination_form
-        st.session_state["active_max_hotels"] = max_hotels_form
         st.session_state["trigger_scrape"] = True
 
 with tab2:
@@ -165,17 +128,8 @@ with tab2:
         key="dest_url_tab"
     )
 
-    max_hotels_url = st.number_input(
-        "📊 Số khách sạn tối đa",
-        min_value=10,
-        max_value=500,
-        value=50,
-        step=10,
-        key="max_hotels_url"
-    )
-
     scrape_url = st.button(
-        "🚀 Bắt đầu Scraping",
+        "🚀 Bắt đầu Scraping — Lấy toàn bộ kết quả",
         disabled=not direct_url.strip() or not dest_url_tab.strip() or st.session_state.is_scraping,
         key="scrape_url_btn",
         use_container_width=True,
@@ -184,8 +138,7 @@ with tab2:
 
     if scrape_url and direct_url.strip():
         st.session_state["active_url"] = direct_url.strip()
-        st.session_state["active_destination"] = dest_url_tab.strip() if dest_url_tab.strip() else "Không xác định"
-        st.session_state["active_max_hotels"] = max_hotels_url
+        st.session_state["active_destination"] = dest_url_tab.strip() or "Không xác định"
         st.session_state["trigger_scrape"] = True
 
 st.markdown("---")
@@ -193,30 +146,23 @@ st.markdown("---")
 if st.session_state.get("trigger_scrape"):
     st.session_state["trigger_scrape"] = False
     st.session_state.is_scraping = True
-    st.session_state.status_messages = []
     st.session_state.scrape_results = None
 
     active_url = st.session_state.get("active_url", "")
     active_destination = st.session_state.get("active_destination", "")
-    active_max_hotels = st.session_state.get("active_max_hotels", 50)
 
     st.subheader("⏳ Đang chạy Scraper...")
-    progress_bar = st.progress(0)
-    status_placeholder = st.empty()
-    log_placeholder = st.empty()
-
     status_messages = []
 
     def update_status(msg: str):
         status_messages.append(msg)
 
-    with st.spinner("Đang kết nối và tải dữ liệu từ Agoda..."):
+    with st.spinner("Đang kết nối và tải toàn bộ dữ liệu từ Agoda..."):
         try:
             results = run_scrape(
                 url=active_url,
                 destination=active_destination,
                 status_callback=update_status,
-                max_hotels=active_max_hotels
             )
             st.session_state.scrape_results = results
         except Exception as e:
@@ -238,6 +184,7 @@ if st.session_state.get("trigger_scrape"):
 if st.session_state.scrape_results:
     results = st.session_state.scrape_results
     df = pd.DataFrame(results)
+    active_destination = st.session_state.get("active_destination", "data")
 
     st.subheader(f"📊 Kết quả: {len(df)} khách sạn")
 
@@ -245,17 +192,13 @@ if st.session_state.scrape_results:
     with col_m1:
         st.metric("🏨 Tổng số khách sạn", len(df))
     with col_m2:
-        has_price = df["Giá thấp nhất (đã gồm thuế & phí)"].astype(bool).sum()
-        st.metric("💰 Có dữ liệu giá", has_price)
+        st.metric("💰 Có dữ liệu giá", df["Giá thấp nhất (đã gồm thuế & phí)"].astype(bool).sum())
     with col_m3:
-        has_star = df["Hạng sao"].astype(bool).sum()
-        st.metric("⭐ Có hạng sao", has_star)
+        st.metric("⭐ Có hạng sao", df["Hạng sao"].astype(bool).sum())
     with col_m4:
-        has_cancel = df["Chính sách hoàn hủy"].astype(bool).sum()
-        st.metric("📋 Có chính sách hủy", has_cancel)
+        st.metric("📋 Có chính sách hủy", df["Chính sách hoàn hủy"].astype(bool).sum())
 
     st.markdown("### 🔍 Preview dữ liệu")
-
     filter_col1, filter_col2 = st.columns(2)
     with filter_col1:
         search_text = st.text_input("🔎 Tìm kiếm theo tên khách sạn", placeholder="Nhập tên...", key="search_filter")
@@ -291,19 +234,14 @@ if st.session_state.scrape_results:
         output_excel = io.BytesIO()
         with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Khách sạn Agoda")
-            worksheet = writer.sheets["Khách sạn Agoda"]
-            col_widths = {
-                "A": 20, "B": 40, "C": 30, "D": 12,
-                "E": 25, "F": 25, "G": 25
-            }
-            for col_letter, width in col_widths.items():
-                worksheet.column_dimensions[col_letter].width = width
+            ws = writer.sheets["Khách sạn Agoda"]
+            for col_letter, width in {"A": 20, "B": 40, "C": 30, "D": 12, "E": 25, "F": 25, "G": 25}.items():
+                ws.column_dimensions[col_letter].width = width
         output_excel.seek(0)
-
         st.download_button(
             label="📥 Tải về Excel (.xlsx)",
             data=output_excel.getvalue(),
-            file_name=f"agoda_hotels_{active_destination if 'active_destination' in st.session_state else 'data'}.xlsx",
+            file_name=f"agoda_{active_destination}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             type="primary"
@@ -314,7 +252,7 @@ if st.session_state.scrape_results:
         st.download_button(
             label="📥 Tải về CSV (.csv)",
             data=csv_data.encode("utf-8-sig"),
-            file_name=f"agoda_hotels_{active_destination if 'active_destination' in st.session_state else 'data'}.csv",
+            file_name=f"agoda_{active_destination}.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -326,7 +264,7 @@ if st.session_state.scrape_results:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #888; font-size: 12px;'>
-⚠️ <strong>Lưu ý:</strong> Tool này chỉ dùng cho mục đích nghiên cứu thị trường. 
+⚠️ <strong>Lưu ý:</strong> Tool này chỉ dùng cho mục đích nghiên cứu thị trường.
 Hãy sử dụng có trách nhiệm và tuân thủ điều khoản sử dụng của Agoda.
 </div>
 """, unsafe_allow_html=True)
