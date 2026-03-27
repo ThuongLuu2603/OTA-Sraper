@@ -208,6 +208,47 @@ def _extract_review_score(hotel: dict) -> str:
     return ""
 
 
+MEAL_PLAN_BENEFIT_IDS = {
+    4: "Bữa sáng",
+    5: "Nửa ngày ăn",
+    8: "Cả ngày ăn",
+    11: "Bữa sáng + tối",
+}
+
+
+def _extract_meal_plan(hotel: dict) -> str:
+    """Return meal plan label from hotel-level benefit IDs, or empty string."""
+    benefits = _safe_get(hotel, "pricing", "benefits", default=[]) or []
+    for bid in benefits:
+        label = MEAL_PLAN_BENEFIT_IDS.get(bid)
+        if label:
+            return label
+    return ""
+
+
+def _extract_landmarks(hotel: dict) -> str:
+    """Return nearest top landmark distance string (e.g. 'Cách Phố Cổ 279m')."""
+    try:
+        top = _safe_get(hotel, "content", "localInformation", "landmarks", "topLandmark", default=[]) or []
+        transport = _safe_get(hotel, "content", "localInformation", "landmarks", "transportation", default=[]) or []
+        items = []
+        for lm in (top[:2] if top else []):
+            name = lm.get("landmarkName", "")
+            dist = lm.get("distanceInM", 0)
+            if name and dist is not None:
+                dist_str = f"{dist/1000:.1f}km" if dist >= 1000 else f"{int(dist)}m"
+                items.append(f"Cách {name} {dist_str}")
+        for lm in (transport[:1] if transport else []):
+            name = lm.get("landmarkName", "")
+            dist = lm.get("distanceInM", 0)
+            if name and dist is not None:
+                dist_str = f"{dist/1000:.1f}km" if dist >= 1000 else f"{int(dist)}m"
+                items.append(f"Cách {name} {dist_str}")
+        return " • ".join(items)
+    except Exception:
+        return ""
+
+
 def parse_hotel_from_graphql(hotel: dict, destination: str) -> dict | None:
     """Extract all fields from a GraphQL hotel property object."""
     info = _safe_get(hotel, "content", "informationSummary", default={})
@@ -219,11 +260,14 @@ def parse_hotel_from_graphql(hotel: dict, destination: str) -> dict | None:
     area_name = _safe_get(info, "address", "area", "name", default="")
     address = f"{area_name}, {city_name}".strip(", ") if area_name else city_name
 
+    landmarks = _extract_landmarks(hotel)
+
     stars_raw = info.get("rating")
     stars = f"{int(stars_raw)} sao" if stars_raw else ""
 
     price_excl = _extract_price(hotel)
     price_incl = _extract_price_inclusive(hotel)
+    meal_plan = _extract_meal_plan(hotel)
     cancellation = _extract_cancellation(hotel)
     review = _extract_review_score(hotel)
 
@@ -234,8 +278,10 @@ def parse_hotel_from_graphql(hotel: dict, destination: str) -> dict | None:
         "Tỉnh thành / Điểm đến": destination,
         "Tên khách sạn": name,
         "Địa chỉ": address,
+        "Địa điểm nổi bật": landmarks,
         "Hạng sao": stars,
         "Điểm đánh giá": review,
+        "Gói bữa ăn": meal_plan,
         "Giá/đêm (chưa gồm thuế)": price_excl,
         "Giá/đêm (đã gồm thuế)": price_incl,
         "Chính sách hoàn hủy": cancellation,
