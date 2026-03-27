@@ -192,18 +192,19 @@ if st.session_state.scrape_results:
     with col_m1:
         st.metric("🏨 Tổng số khách sạn", len(df))
     with col_m2:
-        st.metric("💰 Có dữ liệu giá", df["Giá thấp nhất (chưa gồm thuế)"].astype(bool).sum())
+        price_col = "Giá/đêm (chưa gồm thuế)"
+        st.metric("💰 Có dữ liệu giá", df[price_col].astype(bool).sum() if price_col in df.columns else 0)
     with col_m3:
-        st.metric("⭐ Có hạng sao", df["Hạng sao"].astype(bool).sum())
+        st.metric("⭐ Có hạng sao", df["Hạng sao"].astype(bool).sum() if "Hạng sao" in df.columns else 0)
     with col_m4:
-        st.metric("📋 Có chính sách hủy", df["Chính sách hoàn hủy"].astype(bool).sum())
+        st.metric("📋 Có chính sách hủy", df["Chính sách hoàn hủy"].astype(bool).sum() if "Chính sách hoàn hủy" in df.columns else 0)
 
     st.markdown("### 🔍 Preview dữ liệu")
     filter_col1, filter_col2 = st.columns(2)
     with filter_col1:
         search_text = st.text_input("🔎 Tìm kiếm theo tên khách sạn", placeholder="Nhập tên...", key="search_filter")
     with filter_col2:
-        star_options = ["Tất cả"] + sorted(df["Hạng sao"].dropna().unique().tolist())
+        star_options = ["Tất cả"] + sorted([s for s in df["Hạng sao"].dropna().unique().tolist() if s], key=lambda x: x)
         selected_star = st.selectbox("⭐ Lọc theo hạng sao", star_options, key="star_filter")
 
     filtered_df = df.copy()
@@ -212,19 +213,23 @@ if st.session_state.scrape_results:
     if selected_star != "Tất cả":
         filtered_df = filtered_df[filtered_df["Hạng sao"] == selected_star]
 
+    col_cfg = {
+        "Tỉnh thành / Điểm đến": st.column_config.TextColumn("📍 Điểm đến", width="small"),
+        "Tên khách sạn": st.column_config.TextColumn("🏨 Tên khách sạn", width="large"),
+        "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ", width="medium"),
+        "Hạng sao": st.column_config.TextColumn("⭐ Hạng sao", width="small"),
+        "Điểm đánh giá": st.column_config.TextColumn("⭐ Điểm đánh giá", width="medium"),
+        "Giá/đêm (chưa gồm thuế)": st.column_config.TextColumn("💰 Giá (chưa thuế)", width="medium"),
+        "Giá/đêm (đã gồm thuế)": st.column_config.TextColumn("💰 Giá (đã thuế)", width="medium"),
+        "Chính sách hoàn hủy": st.column_config.TextColumn("📋 Chính sách hủy", width="medium"),
+        "Link khách sạn": st.column_config.LinkColumn("🔗 Link", width="medium"),
+    }
+
     st.dataframe(
         filtered_df,
         use_container_width=True,
         height=450,
-        column_config={
-            "Tỉnh thành / Điểm đến": st.column_config.TextColumn("📍 Điểm đến", width="small"),
-            "Tên khách sạn": st.column_config.TextColumn("🏨 Tên khách sạn", width="large"),
-            "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ", width="medium"),
-            "Hạng sao": st.column_config.TextColumn("⭐ Hạng sao", width="small"),
-            "Giá thấp nhất (đã gồm thuế & phí)": st.column_config.TextColumn("💰 Giá thấp nhất", width="medium"),
-            "Meal Plan": st.column_config.TextColumn("🍽️ Meal Plan", width="medium"),
-            "Chính sách hoàn hủy": st.column_config.TextColumn("📋 Chính sách hủy", width="medium"),
-        }
+        column_config=col_cfg,
     )
 
     st.markdown("### 📥 Tải xuống dữ liệu")
@@ -235,7 +240,7 @@ if st.session_state.scrape_results:
         with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Khách sạn Agoda")
             ws = writer.sheets["Khách sạn Agoda"]
-            for col_letter, width in {"A": 20, "B": 40, "C": 30, "D": 12, "E": 25, "F": 25, "G": 25}.items():
+            for col_letter, width in {"A": 18, "B": 45, "C": 30, "D": 10, "E": 18, "F": 18, "G": 20, "H": 30, "I": 50}.items():
                 ws.column_dimensions[col_letter].width = width
         output_excel.seek(0)
         st.download_button(
