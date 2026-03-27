@@ -145,6 +145,23 @@ def _parse_cancellation(text: str) -> str:
     return ""
 
 
+def _parse_meal_plan(text: str) -> str:
+    """Detect breakfast / meal plan info from card text."""
+    t = text.lower()
+    if any(kw in t for kw in [
+        "bữa sáng miễn phí", "có bữa sáng", "bao gồm bữa sáng",
+        "free breakfast", "breakfast included",
+    ]):
+        return "Có bữa sáng"
+    if any(kw in t for kw in ["bữa sáng", "breakfast"]):
+        return "Bữa sáng"
+    if any(kw in t for kw in ["bán phần", "half board"]):
+        return "Bán phần"
+    if any(kw in t for kw in ["nguyên phần", "full board"]):
+        return "Nguyên phần"
+    return ""
+
+
 def _parse_stars(text: str) -> str:
     m = re.search(r'(\d)\s*sao', text, re.IGNORECASE)
     if m:
@@ -311,7 +328,7 @@ async def _extract_page_hotels(page, destination: str, status_callback=None) -> 
             "Địa chỉ": location,
             "Hạng sao": stars,
             "Điểm đánh giá": score,
-            "Gói bữa ăn": "",
+            "Gói bữa ăn": _parse_meal_plan(clean),
             "Giá/đêm (VND)": price,
             "Chính sách hoàn hủy": cancellation,
             "Link khách sạn": link,
@@ -319,13 +336,18 @@ async def _extract_page_hotels(page, destination: str, status_callback=None) -> 
     return hotels
 
 
-def _make_page_url(base_url: str, page_num: int) -> str:
-    """Build URL for a specific page number by setting the page= param."""
-    url = re.sub(r'([?&])page=\d+', '', base_url).rstrip('&').rstrip('?')
+def _make_page_url(base_url: str, page_idx: int) -> str:
+    """
+    Build URL for Trip.com with 0-indexed pageIndex param.
+    page_idx=0 → base URL (first page)
+    page_idx=1 → &pageIndex=1 (second page)
+    """
+    url = re.sub(r'[?&]pageIndex=\d+', '', base_url).rstrip('&').rstrip('?')
+    url = re.sub(r'[?&]page=\d+', '', url).rstrip('&').rstrip('?')
     sep = '&' if '?' in url else '?'
-    if page_num == 1:
+    if page_idx == 0:
         return url
-    return f"{url}{sep}page={page_num}"
+    return f"{url}{sep}pageIndex={page_idx}"
 
 
 async def _detect_total_hotels(page) -> int:
@@ -389,14 +411,68 @@ def _clean_tripcom_url(raw_url: str) -> str:
         return raw_url
 
 
+async def _scroll_load_all(page, destination: str, status_callback) -> list[dict]:
+    """
+    Scroll-to-load: keep scrolling until no new hotels appear.
+    Trip.com lazy-loads hotels as user scrolls.
+    Returns deduplicated list of all visible hotels.
+    """
+    seen_ids: set[str] = set()
+    all_hotels: list[dict] = []
+    stale_rounds = 0
+
+    for i in range(40):  # max 40 scroll iterations
+        await page.evaluate("window.scrollBy(0, 800)")
+        await asyncio.sleep(1.2)
+
+        payload = await page.evaluate(HOTEL_CARD_JS)
+        if isinstance(payload, dict):
+            raw = payload.get("results", [])
+        else:
+            raw = payload or []
+
+        before = len(all_hotels)
+        for r in raw:
+            hid = r.get("hotelId", "")
+            name = r.get("name", "").strip()
+            if not hid or not name or hid in seen_ids:
+                continue
+            seen_ids.add(hid)
+            text = r.get("fullText", "")
+            link = r.get("link", "")
+            clean = _clean_card_text(text)
+            all_hotels.append({
+                "Tỉnh thành / Điểm đến": destination,
+                "Tên khách sạn": re.sub(r'\s*(Mới dùng Trip\.com|Khai trương năm \d{4}|Được nâng cấp năm \d{4})', '', name).strip(),
+                "Địa chỉ": _parse_location(clean),
+                "Hạng sao": _parse_stars(clean),
+                "Điểm đánh giá": _parse_score(clean),
+                "Gói bữa ăn": _parse_meal_plan(clean),
+                "Giá/đêm (VND)": _parse_vnd_price(clean),
+                "Chính sách hoàn hủy": _parse_cancellation(clean),
+                "Link khách sạn": link,
+            })
+
+        if len(all_hotels) == before:
+            stale_rounds += 1
+            if stale_rounds >= 3:  # 3 scrolls with no new hotels = done
+                break
+        else:
+            stale_rounds = 0
+            if i % 5 == 0:
+                status_callback(f"  📜 Cuộn {i+1}: {len(all_hotels)} khách sạn...")
+
+    return all_hotels
+
+
 async def _scrape_async(url: str, destination: str, status_callback) -> list[dict]:
     """
-    Trip.com scraper using API interception strategy:
-    1. Navigate to URL to capture the hotel-search API endpoint + params from network.
-    2. Replicate that API call via page.evaluate(fetch) for all subsequent pages.
-    3. Falls back to DOM extraction if API not discovered.
+    Trip.com scraper:
+    1. Clean URL, navigate page.
+    2. Scroll-to-load: aggressively scroll until no new hotels appear (lazy-load).
+    3. Paginate via URL with pageIndex param (0-indexed).
+    4. Deduplicate by link URL across all pages.
     """
-    import json as _json
     import math
 
     chromium = get_chromium_path()
@@ -408,9 +484,8 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
         status_callback("🧹 URL đã được làm sạch")
     url = cleaned
 
-    results = []
+    results: list[dict] = []
     seen_links: set[str] = set()
-    api_info: dict = {}  # Captured: url, method, headers, body_str, page_key
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -434,169 +509,59 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
-        # API pattern: Trip.com calls endpoints like /htls/getSortedHotelList
-        API_KEYWORDS = [
-            "getSortedHotelList", "searchHotelList", "queryHotelList",
-            "getHotelList", "/htls/", "hotelSearch", "sortedHotel",
-            "hotel/search", "hotel/list/api", "ibu/hotel",
-        ]
+        total_hotels = 0
 
-        async def on_request(req):
-            if api_info.get("url"):
-                return
-            if not any(kw.lower() in req.url.lower() for kw in API_KEYWORDS):
-                return
-            hdr = dict(req.headers)
-            api_info["url"] = req.url
-            api_info["method"] = req.method
-            api_info["headers"] = hdr
-            if req.method == "POST":
+        for page_idx in range(50):  # 0-indexed pages; stop early on empty
+            # Build page URL: page_idx=0 → no param, page_idx>0 → &pageIndex=N
+            page_url = _make_page_url(url, page_idx)
+
+            if page_idx == 0:
+                status_callback("🌐 Đang mở trang Trip.com...")
+            else:
+                status_callback(f"📄 Đang tải trang {page_idx+1}...")
+
+            try:
+                await page.goto(page_url, wait_until="networkidle", timeout=55000)
+            except PlaywrightTimeoutError:
                 try:
-                    api_info["body_str"] = req.post_data or ""
+                    await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
                 except Exception:
-                    api_info["body_str"] = ""
+                    status_callback(f"⚠️ Không thể tải trang {page_idx+1}.")
+                    break
 
-        async def on_response(resp):
-            if api_info.get("total"):
-                return
-            if resp.status != 200:
-                return
-            if not any(kw.lower() in resp.url.lower() for kw in API_KEYWORDS):
-                return
-            try:
-                body = await resp.text()
-                if len(body) < 100:
-                    return
-                data = _json.loads(body)
-                total = _extract_total(data)
-                if total:
-                    api_info["total"] = total
-                    api_info["first_data"] = data
-            except Exception:
-                pass
+            await asyncio.sleep(3)
 
-        page.on("request", on_request)
-        page.on("response", on_response)
+            # Detect total on first page
+            if page_idx == 0:
+                total_hotels = await _detect_total_hotels(page)
+                if total_hotels:
+                    status_callback(f"📊 Trip.com: tổng ~{total_hotels} khách sạn")
 
-        status_callback("🌐 Đang mở trang Trip.com...")
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=55000)
-        except PlaywrightTimeoutError:
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            except Exception:
-                status_callback("⚠️ Không thể tải Trip.com.")
-                await browser.close()
-                return []
+            # Scroll-to-load: lazy loads hotels as user scrolls down
+            page_hotels = await _scroll_load_all(page, destination, status_callback)
 
-        await asyncio.sleep(4)
-        for _ in range(5):
-            await page.evaluate("window.scrollBy(0, 700)")
-            await asyncio.sleep(0.8)
-        await asyncio.sleep(1)
+            # Deduplicate by link (prefer) or name
+            new_final = []
+            for h in page_hotels:
+                key = h["Link khách sạn"] or h["Tên khách sạn"]
+                if key and key not in seen_links:
+                    seen_links.add(key)
+                    new_final.append(h)
 
-        # Extract page 1 from DOM (always works)
-        hotels_p1 = await _extract_page_hotels(page, destination, status_callback)
-        new_p1 = [h for h in hotels_p1 if h["Link khách sạn"] not in seen_links]
-        for h in new_p1:
-            if h["Link khách sạn"]:
-                seen_links.add(h["Link khách sạn"])
-        results.extend(new_p1)
+            results.extend(new_final)
+            status_callback(f"📄 Trang {page_idx+1}: +{len(new_final)} mới — Tổng: {len(results)}")
 
-        total_hotels = api_info.get("total") or await _detect_total_hotels(page)
-        hotels_per_page = max(len(hotels_p1), 10) if hotels_p1 else 15
-
-        if total_hotels:
-            total_pages = max(1, math.ceil(total_hotels / hotels_per_page))
-            status_callback(f"📊 Tổng {total_hotels} khách sạn → {total_pages} trang. Trang 1: {len(new_p1)} mới")
-        else:
-            total_pages = 20
-            status_callback(f"📄 Trang 1: {len(new_p1)} khách sạn (không phát hiện tổng)")
-
-        if api_info.get("url"):
-            status_callback(f"🔗 API: {api_info['url'].split('?')[0].split('/')[-1]}")
-
-        # ── Pagination: prefer API call → fall back to URL nav ──────────────
-        for page_num in range(2, total_pages + 1):
-            if len(results) >= 2000:
+            if len(new_final) == 0:
+                status_callback("⚠️ Không có khách sạn mới, dừng phân trang.")
                 break
+
+            if len(results) >= 2000:
+                status_callback("⚠️ Đạt giới hạn 2000, dừng.")
+                break
+
             if total_hotels and len(results) >= total_hotels:
                 status_callback(f"✅ Đã đủ {len(results)} khách sạn.")
                 break
-
-            status_callback(f"📄 Đang tải trang {page_num}/{total_pages}...")
-
-            got_new = False
-
-            # Strategy A: replicate API call with page index incremented
-            if api_info.get("url") and api_info.get("body_str"):
-                try:
-                    body_obj = _json.loads(api_info["body_str"])
-                    # Find the page/pageIndex key
-                    for key in ("pageIndex", "page", "pageNum", "pageNo"):
-                        if key in body_obj:
-                            body_obj[key] = page_num - 1 if key == "pageIndex" else page_num
-                            break
-                    else:
-                        body_obj["pageIndex"] = page_num - 1
-
-                    new_body = _json.dumps(body_obj)
-                    hdr_js = _json.dumps(api_info["headers"])
-                    raw = await page.evaluate(f"""async () => {{
-                        const resp = await fetch({_json.dumps(api_info['url'])}, {{
-                            method: 'POST',
-                            headers: {hdr_js},
-                            body: {_json.dumps(new_body)},
-                            credentials: 'include'
-                        }});
-                        return await resp.text();
-                    }}""")
-                    api_data = _json.loads(raw)
-                    hotels_api = _parse_hotels_from_api(api_data, destination)
-                    new_h = [h for h in hotels_api if h["Link khách sạn"] not in seen_links]
-                    for h in new_h:
-                        if h["Link khách sạn"]:
-                            seen_links.add(h["Link khách sạn"])
-                    results.extend(new_h)
-                    status_callback(f"  → API trang {page_num}: +{len(new_h)} mới (tổng: {len(results)})")
-                    if new_h:
-                        got_new = True
-                    elif not new_h:
-                        status_callback("⚠️ API không còn khách sạn, dừng.")
-                        break
-                except Exception as e:
-                    status_callback(f"  ⚠️ API call lỗi: {e!s:.80s}, thử URL nav...")
-
-            # Strategy B: URL-based navigation (fallback)
-            if not got_new:
-                page_url = _make_page_url(url, page_num)
-                try:
-                    await page.goto(page_url, wait_until="networkidle", timeout=45000)
-                except PlaywrightTimeoutError:
-                    await page.goto(page_url, wait_until="domcontentloaded", timeout=25000)
-
-                await asyncio.sleep(5)
-                for _ in range(5):
-                    await page.evaluate("window.scrollBy(0, 700)")
-                    await asyncio.sleep(0.8)
-                await asyncio.sleep(2)
-
-                hotels_nav = await _extract_page_hotels(page, destination, status_callback)
-                new_nav = [h for h in hotels_nav if h["Link khách sạn"] not in seen_links]
-                for h in new_nav:
-                    if h["Link khách sạn"]:
-                        seen_links.add(h["Link khách sạn"])
-                results.extend(new_nav)
-                status_callback(f"  → URL trang {page_num}: +{len(new_nav)} mới (tổng: {len(results)})")
-
-                if not new_nav:
-                    try:
-                        diag = await page.evaluate(DIAG_JS)
-                        status_callback(f"  🔍 {diag.get('counts',{})} | {diag.get('bodySnippet','')[:100]}")
-                    except Exception:
-                        pass
-                    status_callback("⚠️ Không có khách sạn mới, dừng.")
-                    break
 
         await browser.close()
 
