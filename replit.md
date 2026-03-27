@@ -48,15 +48,20 @@ Every package extends `tsconfig.base.json` which sets `composite: true`. The roo
 - `pnpm run build` — runs `typecheck` first, then recursively runs `build` in all packages that define it
 - `pnpm run typecheck` — runs `tsc --build --emitDeclarationOnly` using project references
 
-## Agoda Scraper (Python/Streamlit)
+## Multi-OTA Hotel Scraper (Python/Streamlit)
 
-Standalone Python app at `agoda-scraper/` for scraping hotel data from Agoda.
+Standalone Python app at `agoda-scraper/` supporting **Agoda** and **Trip.com**.
 
-- `app.py` — Streamlit UI with 2-tab input (form + direct URL), preview table, Excel/CSV download
-- `scraper.py` — Playwright-based async scraper with auto-scroll, random User-Agent, random delays
+- `app.py` — Streamlit UI: OTA selector (Agoda/Trip.com), input forms, preview table with filters, Excel/CSV download. Orange theme for Agoda, blue for Trip.com.
+- `scraper.py` — Agoda GraphQL-based scraper. City search via `/graphql/search`, VND currency injection, 11 data columns including meal plan and landmarks.
+- `scraper_tripcom.py` — Trip.com DOM-based scraper (no CAPTCHA). Scrapes `div.hotel-card` elements. Covers 30+ Vietnamese cities via hard-coded Trip.com city IDs. Extracts: name, score, VND price, nearest location, cancellation policy, hotel link.
 - `.streamlit/config.toml` — Streamlit server config (port 5000)
 - `requirements.txt` — Python dependencies
-- Run via workflow "Agoda Scraper": `cd agoda-scraper && streamlit run app.py --server.port 5000`
+- Run via workflow "artifacts/agoda-scraper-web: web": `cd agoda-scraper && streamlit run app.py --server.port 5000`
+- **Traveloka**: NOT supported — blocked by AWS WAF visual CAPTCHA that prevents all headless automation.
+
+### Trip.com City IDs (Vietnam, countryId=111)
+Hà Nội=286, HCM=301, Đà Nẵng=1356, Đà Lạt=5204, Nha Trang=1777, Phú Quốc=5649, Vũng Tàu=7529, Hội An=5206, Huế=5207, Hạ Long=5201
 
 ## Packages
 
