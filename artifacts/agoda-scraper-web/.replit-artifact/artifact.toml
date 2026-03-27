@@ -1,0 +1,22 @@
+kind = "web"
+previewPath = "/"
+title = "Agoda Scraper"
+version = "1.0.0"
+id = "artifacts/agoda-scraper-web"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 5000
+
+[services.development]
+run = "cd /home/runner/workspace/agoda-scraper && streamlit run app.py --server.port 5000"
+
+[services.env]
+PORT = "5000"
+BASE_PATH = "/"
