@@ -271,136 +271,206 @@ if ota_name == "Agoda":
 
 # ── TRIP.COM ─────────────────────────────────────────────────────────────────
 elif ota_name == "Trip.com":
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    st.markdown("""<div class="info-badge info-badge-tripcom">
-      🌐 Hỗ trợ: Hà Nội · TP. HCM · Đà Nẵng · Phú Quốc · Nha Trang · Đà Lạt · Hội An · Hạ Long · Huế · Vũng Tàu và nhiều nơi khác.
-    </div>""", unsafe_allow_html=True)
+    tab_t1, tab_t2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
 
-    st.markdown("<div class='section-label'>📍 Điểm đến</div>", unsafe_allow_html=True)
-    trip_dest = st.text_input("Điểm đến", placeholder="VD: Hà Nội, Đà Nẵng, Phú Quốc...",
-                              key="trip_dest", label_visibility="collapsed")
+    with tab_t1:
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div class="info-badge info-badge-tripcom">
+          🌐 Hỗ trợ: Hà Nội · TP. HCM · Đà Nẵng · Phú Quốc · Nha Trang · Đà Lạt · Hội An · Hạ Long · Huế · Vũng Tàu và nhiều nơi khác.
+        </div>""", unsafe_allow_html=True)
 
-    if trip_dest.strip():
-        city_info = resolve_trip_city(trip_dest.strip())
-        if city_info:
-            st.caption(f"✅ Tìm thấy City ID = {city_info[0]}")
+        st.markdown("<div class='section-label'>📍 Điểm đến</div>", unsafe_allow_html=True)
+        trip_dest = st.text_input("Điểm đến", placeholder="VD: Hà Nội, Đà Nẵng, Phú Quốc...",
+                                  key="trip_dest", label_visibility="collapsed")
+
+        if trip_dest.strip():
+            city_info = resolve_trip_city(trip_dest.strip())
+            if city_info:
+                st.caption(f"✅ Tìm thấy City ID = {city_info[0]}")
+            else:
+                st.warning(f"⚠️ Chưa hỗ trợ '{trip_dest}'. Thêm thành phố trong tương lai.")
+
+        col_t1, col_t2 = st.columns(2, gap="medium")
+        with col_t1:
+            st.markdown("<div class='section-label'>📅 Check-in</div>", unsafe_allow_html=True)
+            trip_checkin = st.date_input("Check-in", value=today + timedelta(days=7),
+                                         min_value=today, key="trip_checkin", label_visibility="collapsed")
+        with col_t2:
+            st.markdown("<div class='section-label'>📅 Check-out</div>", unsafe_allow_html=True)
+            trip_checkout = st.date_input("Check-out", value=today + timedelta(days=8),
+                                          min_value=today + timedelta(days=1), key="trip_checkout", label_visibility="collapsed")
+
+        col_t3, col_t4, col_t5 = st.columns(3, gap="medium")
+        with col_t3:
+            st.markdown("<div class='section-label'>🛏️ Số phòng</div>", unsafe_allow_html=True)
+            trip_rooms = st.number_input("Phòng", 1, 10, 1, key="trip_rooms", label_visibility="collapsed")
+        with col_t4:
+            st.markdown("<div class='section-label'>👤 Người lớn</div>", unsafe_allow_html=True)
+            trip_adults = st.number_input("Người lớn", 1, 20, 2, key="trip_adults", label_visibility="collapsed")
+        with col_t5:
+            st.markdown("<div class='section-label'>👶 Trẻ em</div>", unsafe_allow_html=True)
+            trip_children = st.number_input("Trẻ em", 0, 10, 0, key="trip_children", label_visibility="collapsed")
+
+        if trip_checkin >= trip_checkout:
+            st.error("⚠️ Check-out phải sau Check-in!")
+            trip_btn_disabled = True
         else:
-            st.warning(f"⚠️ Chưa hỗ trợ '{trip_dest}'. Thêm thành phố trong tương lai.")
+            trip_btn_disabled = False
 
-    col_t1, col_t2 = st.columns(2, gap="medium")
-    with col_t1:
-        st.markdown("<div class='section-label'>📅 Check-in</div>", unsafe_allow_html=True)
-        trip_checkin = st.date_input("Check-in", value=today + timedelta(days=7),
-                                     min_value=today, key="trip_checkin", label_visibility="collapsed")
-    with col_t2:
-        st.markdown("<div class='section-label'>📅 Check-out</div>", unsafe_allow_html=True)
-        trip_checkout = st.date_input("Check-out", value=today + timedelta(days=8),
-                                      min_value=today + timedelta(days=1), key="trip_checkout", label_visibility="collapsed")
+        trip_city_info = resolve_trip_city(trip_dest.strip()) if trip_dest.strip() else None
 
-    col_t3, col_t4, col_t5 = st.columns(3, gap="medium")
-    with col_t3:
-        st.markdown("<div class='section-label'>🛏️ Số phòng</div>", unsafe_allow_html=True)
-        trip_rooms = st.number_input("Phòng", 1, 10, 1, key="trip_rooms", label_visibility="collapsed")
-    with col_t4:
-        st.markdown("<div class='section-label'>👤 Người lớn</div>", unsafe_allow_html=True)
-        trip_adults = st.number_input("Người lớn", 1, 20, 2, key="trip_adults", label_visibility="collapsed")
-    with col_t5:
-        st.markdown("<div class='section-label'>👶 Trẻ em</div>", unsafe_allow_html=True)
-        trip_children = st.number_input("Trẻ em", 0, 10, 0, key="trip_children", label_visibility="collapsed")
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("🚀  Bắt đầu thu thập",
+                     disabled=trip_btn_disabled or not trip_dest.strip() or not trip_city_info or st.session_state.is_scraping,
+                     key="trip_btn", use_container_width=True, type="primary"):
+            city_id, country_id = trip_city_info
+            url = build_tripcom_url(city_id=city_id,
+                                    check_in=trip_checkin.strftime("%Y-%m-%d"),
+                                    check_out=trip_checkout.strftime("%Y-%m-%d"),
+                                    rooms=trip_rooms, adults=trip_adults, children=trip_children)
+            st.session_state.update({"active_url": url, "active_destination": trip_dest.strip(), "trigger_scrape": True,
+                                      "trip_city_info": trip_city_info})
 
-    if trip_checkin >= trip_checkout:
-        st.error("⚠️ Check-out phải sau Check-in!")
-        trip_btn_disabled = True
-    else:
-        trip_btn_disabled = False
-
-    trip_city_info = resolve_trip_city(trip_dest.strip()) if trip_dest.strip() else None
-
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    if st.button("🚀  Bắt đầu thu thập",
-                 disabled=trip_btn_disabled or not trip_dest.strip() or not trip_city_info or st.session_state.is_scraping,
-                 key="trip_btn", use_container_width=True, type="primary"):
-        city_id, country_id = trip_city_info
-        url = build_tripcom_url(city_id=city_id,
-                                check_in=trip_checkin.strftime("%Y-%m-%d"),
-                                check_out=trip_checkout.strftime("%Y-%m-%d"),
-                                rooms=trip_rooms, adults=trip_adults, children=trip_children)
-        st.session_state.update({"active_url": url, "active_destination": trip_dest.strip(), "trigger_scrape": True,
-                                  "trip_city_info": trip_city_info})
+    with tab_t2:
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div class="info-badge info-badge-tripcom">
+          💡 Truy cập <b>vn.trip.com/hotels</b>, tìm kiếm khách sạn theo khu vực/tỉnh bất kỳ, copy URL từ thanh địa chỉ và dán vào đây.
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<div class='section-label'>🔗 URL tìm kiếm Trip.com</div>", unsafe_allow_html=True)
+        trip_direct_url = st.text_area("URL", placeholder="https://vn.trip.com/hotels/list?city=286&checkIn=2026-04-22...",
+                                        height=90, key="trip_url", label_visibility="collapsed")
+        st.markdown("<div class='section-label'>🗺️ Tên điểm đến</div>", unsafe_allow_html=True)
+        trip_dest_url = st.text_input("Điểm đến", placeholder="VD: An Giang, Ninh Bình...",
+                                       key="trip_dest_url", label_visibility="collapsed")
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("🚀  Bắt đầu thu thập",
+                     disabled=not trip_direct_url.strip() or not trip_dest_url.strip() or st.session_state.is_scraping,
+                     key="trip_url_btn", use_container_width=True, type="primary"):
+            st.session_state.update({
+                "active_url": trip_direct_url.strip(),
+                "active_destination": trip_dest_url.strip(),
+                "trigger_scrape": True,
+            })
 
 # ── MYTOUR.VN ────────────────────────────────────────────────────────────────
 elif ota_name == "Mytour.vn":
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    st.markdown("""<div class="info-badge info-badge-mytour">
-      🌐 Hỗ trợ: Hà Nội · TP. HCM · Đà Nẵng · Phú Quốc · Nha Trang · Đà Lạt · Hội An · Hạ Long · Huế · Vũng Tàu · Sa Pa và nhiều nơi khác.
-    </div>""", unsafe_allow_html=True)
+    tab_m1, tab_m2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
 
-    st.markdown("<div class='section-label'>📍 Điểm đến</div>", unsafe_allow_html=True)
-    mytour_dest = st.text_input("Điểm đến", placeholder="VD: Hà Nội, Đà Nẵng, Phú Quốc...",
-                                key="mytour_dest", label_visibility="collapsed")
+    with tab_m1:
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div class="info-badge info-badge-mytour">
+          🌐 Hỗ trợ: Hà Nội · TP. HCM · Đà Nẵng · Phú Quốc · Nha Trang · Đà Lạt · Hội An · Hạ Long · Huế · Vũng Tàu · Sa Pa và nhiều nơi khác.
+        </div>""", unsafe_allow_html=True)
 
-    if mytour_dest.strip():
-        city_info_mt = resolve_mytour_city(mytour_dest.strip())
-        if city_info_mt:
-            st.caption(f"✅ Tìm thấy điểm đến: {city_info_mt[1]}")
+        st.markdown("<div class='section-label'>📍 Điểm đến</div>", unsafe_allow_html=True)
+        mytour_dest = st.text_input("Điểm đến", placeholder="VD: Hà Nội, Đà Nẵng, Phú Quốc...",
+                                    key="mytour_dest", label_visibility="collapsed")
+
+        if mytour_dest.strip():
+            city_info_mt = resolve_mytour_city(mytour_dest.strip())
+            if city_info_mt:
+                st.caption(f"✅ Tìm thấy điểm đến: {city_info_mt[1]}")
+            else:
+                st.warning(f"⚠️ Chưa hỗ trợ '{mytour_dest}'. Thêm điểm đến trong tương lai.")
+
+        col_m1, col_m2 = st.columns(2, gap="medium")
+        with col_m1:
+            st.markdown("<div class='section-label'>📅 Check-in</div>", unsafe_allow_html=True)
+            mytour_checkin = st.date_input("Check-in", value=today + timedelta(days=7),
+                                           min_value=today, key="mytour_checkin", label_visibility="collapsed")
+        with col_m2:
+            st.markdown("<div class='section-label'>📅 Check-out</div>", unsafe_allow_html=True)
+            mytour_checkout = st.date_input("Check-out", value=today + timedelta(days=8),
+                                            min_value=today + timedelta(days=1), key="mytour_checkout", label_visibility="collapsed")
+
+        col_m3, col_m4, col_m5 = st.columns(3, gap="medium")
+        with col_m3:
+            st.markdown("<div class='section-label'>🛏️ Số phòng</div>", unsafe_allow_html=True)
+            mytour_rooms = st.number_input("Phòng", 1, 10, 1, key="mytour_rooms", label_visibility="collapsed")
+        with col_m4:
+            st.markdown("<div class='section-label'>👤 Người lớn</div>", unsafe_allow_html=True)
+            mytour_adults = st.number_input("Người lớn", 1, 20, 2, key="mytour_adults", label_visibility="collapsed")
+        with col_m5:
+            st.markdown("<div class='section-label'>👶 Trẻ em</div>", unsafe_allow_html=True)
+            mytour_children = st.number_input("Trẻ em", 0, 10, 0, key="mytour_children", label_visibility="collapsed")
+
+        if mytour_checkin >= mytour_checkout:
+            st.error("⚠️ Check-out phải sau Check-in!")
+            mytour_btn_disabled = True
         else:
-            st.warning(f"⚠️ Chưa hỗ trợ '{mytour_dest}'. Thêm điểm đến trong tương lai.")
+            mytour_btn_disabled = False
 
-    col_m1, col_m2 = st.columns(2, gap="medium")
-    with col_m1:
-        st.markdown("<div class='section-label'>📅 Check-in</div>", unsafe_allow_html=True)
-        mytour_checkin = st.date_input("Check-in", value=today + timedelta(days=7),
-                                       min_value=today, key="mytour_checkin", label_visibility="collapsed")
-    with col_m2:
-        st.markdown("<div class='section-label'>📅 Check-out</div>", unsafe_allow_html=True)
-        mytour_checkout = st.date_input("Check-out", value=today + timedelta(days=8),
-                                        min_value=today + timedelta(days=1), key="mytour_checkout", label_visibility="collapsed")
+        mytour_city_info = resolve_mytour_city(mytour_dest.strip()) if mytour_dest.strip() else None
 
-    col_m3, col_m4, col_m5 = st.columns(3, gap="medium")
-    with col_m3:
-        st.markdown("<div class='section-label'>🛏️ Số phòng</div>", unsafe_allow_html=True)
-        mytour_rooms = st.number_input("Phòng", 1, 10, 1, key="mytour_rooms", label_visibility="collapsed")
-    with col_m4:
-        st.markdown("<div class='section-label'>👤 Người lớn</div>", unsafe_allow_html=True)
-        mytour_adults = st.number_input("Người lớn", 1, 20, 2, key="mytour_adults", label_visibility="collapsed")
-    with col_m5:
-        st.markdown("<div class='section-label'>👶 Trẻ em</div>", unsafe_allow_html=True)
-        mytour_children = st.number_input("Trẻ em", 0, 10, 0, key="mytour_children", label_visibility="collapsed")
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("🚀  Bắt đầu thu thập",
+                     disabled=mytour_btn_disabled or not mytour_dest.strip() or not mytour_city_info or st.session_state.is_scraping,
+                     key="mytour_btn", use_container_width=True, type="primary"):
+            province_id_val, display_name = mytour_city_info
+            ci_str = mytour_checkin.strftime("%d-%m-%Y")
+            co_str = mytour_checkout.strftime("%d-%m-%Y")
+            slug = mytour_dest.strip().lower()
+            slug = slug.replace("ồ", "o").replace("ội", "oi").replace("à", "a").replace("ẵng", "ang")
+            slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+            url = build_mytour_url(city_slug=slug, check_in=ci_str, check_out=co_str,
+                                   rooms=mytour_rooms, adults=mytour_adults, children=mytour_children)
+            st.session_state.update({
+                "active_url": url,
+                "active_destination": mytour_dest.strip(),
+                "trigger_scrape": True,
+                "mytour_province_id": province_id_val,
+                "mytour_city_slug": slug,
+                "mytour_paste_mode": False,
+                "check_in_str": ci_str,
+                "check_out_str": co_str,
+                "mytour_rooms": mytour_rooms,
+                "mytour_adults": mytour_adults,
+                "mytour_children": mytour_children,
+            })
 
-    if mytour_checkin >= mytour_checkout:
-        st.error("⚠️ Check-out phải sau Check-in!")
-        mytour_btn_disabled = True
-    else:
-        mytour_btn_disabled = False
+    with tab_m2:
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div class="info-badge info-badge-mytour">
+          💡 Truy cập <b>mytour.vn/khach-san</b>, tìm kiếm theo khu vực/tỉnh/thành bất kỳ, copy URL từ thanh địa chỉ và dán vào đây.
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<div class='section-label'>🔗 URL tìm kiếm Mytour.vn</div>", unsafe_allow_html=True)
+        mt_direct_url = st.text_area("URL", placeholder="https://mytour.vn/khach-san/search?aliasCode=tp3&checkIn=22-04-2026...",
+                                      height=90, key="mt_url", label_visibility="collapsed")
+        st.markdown("<div class='section-label'>🗺️ Tên điểm đến</div>", unsafe_allow_html=True)
+        mt_dest_url = st.text_input("Điểm đến", placeholder="VD: An Giang, Ninh Bình...",
+                                     key="mt_dest_url", label_visibility="collapsed")
 
-    mytour_city_info = resolve_mytour_city(mytour_dest.strip()) if mytour_dest.strip() else None
+        # Parse dates from pasted URL for display
+        mt_ci_parsed, mt_co_parsed = "", ""
+        if mt_direct_url.strip():
+            from urllib.parse import urlparse, parse_qs
+            try:
+                parsed = urlparse(mt_direct_url.strip())
+                params = parse_qs(parsed.query)
+                mt_ci_parsed = params.get("checkIn", [""])[0]
+                mt_co_parsed = params.get("checkOut", [""])[0]
+                if mt_ci_parsed and mt_co_parsed:
+                    st.caption(f"📅 Ngày phát hiện từ URL: check-in **{mt_ci_parsed}** → check-out **{mt_co_parsed}**")
+            except Exception:
+                pass
 
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    if st.button("🚀  Bắt đầu thu thập",
-                 disabled=mytour_btn_disabled or not mytour_dest.strip() or not mytour_city_info or st.session_state.is_scraping,
-                 key="mytour_btn", use_container_width=True, type="primary"):
-        province_id_val, display_name = mytour_city_info
-        ci_str = mytour_checkin.strftime("%d-%m-%Y")
-        co_str = mytour_checkout.strftime("%d-%m-%Y")
-        # Derive slug from destination for URL display
-        slug = mytour_dest.strip().lower()
-        slug = slug.replace("ồ", "o").replace("ội", "oi").replace("à", "a").replace("ẵng", "ang")
-        slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
-        url = build_mytour_url(city_slug=slug, check_in=ci_str, check_out=co_str,
-                               rooms=mytour_rooms, adults=mytour_adults, children=mytour_children)
-        st.session_state.update({
-            "active_url": url,
-            "active_destination": mytour_dest.strip(),
-            "trigger_scrape": True,
-            "mytour_city_info": mytour_city_info,
-            "mytour_province_id": province_id_val,
-            "mytour_city_slug": slug,
-            "check_in_str": ci_str,
-            "check_out_str": co_str,
-            "mytour_rooms": mytour_rooms,
-            "mytour_adults": mytour_adults,
-            "mytour_children": mytour_children,
-        })
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("🚀  Bắt đầu thu thập",
+                     disabled=not mt_direct_url.strip() or not mt_dest_url.strip() or st.session_state.is_scraping,
+                     key="mt_url_btn", use_container_width=True, type="primary"):
+            st.session_state.update({
+                "active_url": mt_direct_url.strip(),
+                "active_destination": mt_dest_url.strip(),
+                "trigger_scrape": True,
+                "mytour_province_id": None,
+                "mytour_city_slug": "",
+                "mytour_paste_mode": True,
+                "check_in_str": mt_ci_parsed,
+                "check_out_str": mt_co_parsed,
+                "mytour_rooms": 1,
+                "mytour_adults": 2,
+                "mytour_children": 0,
+            })
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -428,16 +498,27 @@ if st.session_state.get("trigger_scrape"):
                 co_str = st.session_state.get("check_out_str", "")
                 pid = st.session_state.get("mytour_province_id")
                 slug = st.session_state.get("mytour_city_slug", "")
+                paste_mode = st.session_state.get("mytour_paste_mode", False)
                 mt_rooms = st.session_state.get("mytour_rooms", 1)
                 mt_adults = st.session_state.get("mytour_adults", 2)
                 mt_children = st.session_state.get("mytour_children", 0)
-                results = run_scrape_mytour(
-                    url=active_url, destination=active_destination,
-                    check_in=ci_str, check_out=co_str,
-                    province_id=pid, city_slug=slug,
-                    rooms=mt_rooms, adults=mt_adults, children=mt_children,
-                    status_callback=update_status,
-                )
+                if paste_mode or pid is None:
+                    # Paste mode: navigate to pasted URL, intercept all API responses
+                    results = run_scrape_mytour(
+                        url=active_url, destination=active_destination,
+                        check_in=ci_str, check_out=co_str,
+                        province_id=None, city_slug="",
+                        rooms=mt_rooms, adults=mt_adults, children=mt_children,
+                        status_callback=update_status,
+                    )
+                else:
+                    results = run_scrape_mytour(
+                        url=active_url, destination=active_destination,
+                        check_in=ci_str, check_out=co_str,
+                        province_id=pid, city_slug=slug,
+                        rooms=mt_rooms, adults=mt_adults, children=mt_children,
+                        status_callback=update_status,
+                    )
             st.session_state.scrape_results = results
         except Exception as e:
             st.error(f"❌  Lỗi: {str(e)}")

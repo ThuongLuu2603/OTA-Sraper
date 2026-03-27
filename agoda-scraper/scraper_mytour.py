@@ -392,12 +392,15 @@ async def _scrape_async(province_id: int, destination: str,
 # Fallback: intercept-based scrape (when province_id is None)
 # ---------------------------------------------------------------------------
 
-async def _scrape_intercept_async(city_slug: str, destination: str,
+async def _scrape_intercept_async(direct_url: str, destination: str,
                                    check_in: str, check_out: str,
                                    province_fragments: list[str],
-                                   rooms: int, adults: int, children: int,
                                    status_callback) -> list[dict]:
-    """Fallback: load search page, intercept API responses, filter by province name."""
+    """
+    Fallback / paste-URL mode:
+    Navigate to the provided URL, intercept availability API responses,
+    optionally filter by province name fragments.
+    """
     chromium = get_chromium_path()
     if not chromium:
         raise RuntimeError("Không tìm thấy Chromium.")
@@ -443,22 +446,52 @@ async def _scrape_intercept_async(city_slug: str, destination: str,
 
         page.on("response", on_response)
 
-        url = (
-            f"https://www.mytour.vn/khach-san?q={city_slug}"
-            f"&checkIn={check_in}&checkOut={check_out}"
-            f"&rooms={rooms}&adults={adults}&children={children}"
-        )
-        status_callback(f"🌐 Đang mở trang Mytour (chế độ intercept)...")
+        status_callback(f"🌐 Đang mở trang Mytour (chế độ URL trực tiếp)...")
         try:
-            await page.goto(url, wait_until="networkidle", timeout=50000)
+            await page.goto(direct_url, wait_until="networkidle", timeout=50000)
         except PlaywrightTimeoutError:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
 
         await asyncio.sleep(6)
-        for _ in range(6):
-            await page.evaluate("window.scrollBy(0, 600)")
+        status_callback(f"📦 Trang 1 — {len(results)} khách sạn")
+
+        # Scroll to trigger lazy-loaded cards
+        for _ in range(8):
+            await page.evaluate("window.scrollBy(0, 700)")
             await asyncio.sleep(1.5)
-        status_callback(f"📦 Intercept mode — {len(results)} khách sạn khớp")
+
+        status_callback(f"📦 Sau scroll — {len(results)} khách sạn")
+
+        # Try to paginate
+        for page_num in range(2, 11):
+            before = len(results)
+            next_btn = None
+            for sel in [
+                "[class*='pagination'] [aria-label='Go to next page']",
+                "[class*='pagination'] button:last-child:not([disabled])",
+                "button[aria-label*='next']:not([disabled])",
+                "li.next:not(.disabled) a",
+            ]:
+                el = await page.query_selector(sel)
+                if el:
+                    is_disabled = await el.get_attribute("disabled")
+                    if is_disabled is None:
+                        next_btn = el
+                        break
+
+            if not next_btn:
+                break
+
+            await next_btn.click()
+            await asyncio.sleep(4)
+            for _ in range(4):
+                await page.evaluate("window.scrollBy(0, 600)")
+                await asyncio.sleep(1)
+
+            new_count = len(results) - before
+            status_callback(f"📄 Trang {page_num}: +{new_count} mới (tổng: {len(results)})")
+            if new_count == 0:
+                break
 
         await browser.close()
 
@@ -493,11 +526,12 @@ def run_scrape_mytour(url: str, destination: str, check_in: str, check_out: str,
             status_callback=status_callback,
         ))
     else:
+        # Use pasted URL directly (or fallback URL)
+        direct_url = url or f"https://www.mytour.vn/khach-san?q={city_slug}&checkIn={check_in}&checkOut={check_out}&rooms={rooms}&adults={adults}&children={children}"
         return asyncio.run(_scrape_intercept_async(
-            city_slug=city_slug,
+            direct_url=direct_url,
             destination=destination,
             check_in=check_in, check_out=check_out,
             province_fragments=province_fragments or [],
-            rooms=rooms, adults=adults, children=children,
             status_callback=status_callback,
         ))
