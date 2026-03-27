@@ -137,7 +137,12 @@ with tab2:
     )
 
     if scrape_url and direct_url.strip():
-        st.session_state["active_url"] = direct_url.strip()
+        # Ensure VND currency params are present in the URL for accurate VND prices
+        pasted = direct_url.strip()
+        if "currency=VND" not in pasted:
+            sep = "&" if "?" in pasted else "?"
+            pasted += f"{sep}currency=VND&currencyCode=VND&priceCur=VND"
+        st.session_state["active_url"] = pasted
         st.session_state["active_destination"] = dest_url_tab.strip() or "Không xác định"
         st.session_state["trigger_scrape"] = True
 

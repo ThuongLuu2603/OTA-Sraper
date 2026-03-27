@@ -99,6 +99,8 @@ def build_agoda_url(
         f"&children={children}"
         f"&los={nights}"
         f"&priceCur=VND"
+        f"&currency=VND"
+        f"&currencyCode=VND"
         f"&productType=-1"
     )
     if children > 0 and child_ages:
@@ -120,46 +122,51 @@ def _safe_get(d, *keys, default=None):
     return d if d is not None else default
 
 
-def _extract_price(hotel: dict) -> str:
+def _collect_prices(hotel: dict) -> list[dict]:
     """
-    Extract price from GraphQL hotel object.
-    Returns formatted string like "88.43 USD" or "".
+    Collect all (exclusive, inclusive, currency) price entries from all offers.
+    Returns list of dicts sorted by exclusive price ascending (cheapest first).
     """
+    entries = []
     try:
         offers = _safe_get(hotel, "pricing", "offers", default=[])
         for offer in offers:
-            room_offers = offer.get("roomOffers", [])
-            for ro in room_offers:
-                pricings = _safe_get(ro, "room", "pricing", default=[])
-                for price_entry in pricings:
-                    currency = price_entry.get("currency", "USD")
-                    exclusive = _safe_get(
-                        price_entry, "price", "perNight", "exclusive", "display"
-                    )
-                    if exclusive is not None:
-                        return f"{exclusive:,.2f} {currency}"
+            for ro in offer.get("roomOffers", []):
+                for pe in _safe_get(ro, "room", "pricing", default=[]):
+                    currency = pe.get("currency", "USD")
+                    excl = _safe_get(pe, "price", "perNight", "exclusive", "display")
+                    incl = _safe_get(pe, "price", "perNight", "inclusive", "display")
+                    if excl is not None:
+                        entries.append({"currency": currency, "excl": excl, "incl": incl or excl})
     except Exception:
         pass
+    # Sort by exclusive price ascending → cheapest first
+    entries.sort(key=lambda x: x["excl"])
+    return entries
+
+
+def _format_price(amount: float, currency: str) -> str:
+    """Format a price amount with currency."""
+    if currency in ("VND", "JPY", "KRW", "IDR"):
+        return f"{amount:,.0f} {currency}"
+    return f"{amount:,.2f} {currency}"
+
+
+def _extract_price(hotel: dict) -> str:
+    """Extract cheapest exclusive (before-tax) price per night."""
+    entries = _collect_prices(hotel)
+    if entries:
+        e = entries[0]
+        return _format_price(e["excl"], e["currency"])
     return ""
 
 
 def _extract_price_inclusive(hotel: dict) -> str:
-    """Extract inclusive (with tax) price per night."""
-    try:
-        offers = _safe_get(hotel, "pricing", "offers", default=[])
-        for offer in offers:
-            room_offers = offer.get("roomOffers", [])
-            for ro in room_offers:
-                pricings = _safe_get(ro, "room", "pricing", default=[])
-                for price_entry in pricings:
-                    currency = price_entry.get("currency", "USD")
-                    inclusive = _safe_get(
-                        price_entry, "price", "perNight", "inclusive", "display"
-                    )
-                    if inclusive is not None:
-                        return f"{inclusive:,.2f} {currency}"
-    except Exception:
-        pass
+    """Extract cheapest inclusive (with-tax) price per night."""
+    entries = _collect_prices(hotel)
+    if entries:
+        e = entries[0]
+        return _format_price(e["incl"], e["currency"])
     return ""
 
 
