@@ -423,9 +423,9 @@ elif ota_name == "Mytour.vn":
                 "mytour_paste_mode": False,
                 "check_in_str": ci_str,
                 "check_out_str": co_str,
-                "mytour_rooms": mytour_rooms,
-                "mytour_adults": mytour_adults,
-                "mytour_children": mytour_children,
+                "_mt_rooms": mytour_rooms,
+                "_mt_adults": mytour_adults,
+                "_mt_children": mytour_children,
             })
 
     with tab_m2:
@@ -467,9 +467,9 @@ elif ota_name == "Mytour.vn":
                 "mytour_paste_mode": True,
                 "check_in_str": mt_ci_parsed,
                 "check_out_str": mt_co_parsed,
-                "mytour_rooms": 1,
-                "mytour_adults": 2,
-                "mytour_children": 0,
+                "_mt_rooms": 1,
+                "_mt_adults": 2,
+                "_mt_children": 0,
             })
 
 st.markdown("</div>", unsafe_allow_html=True)
@@ -499,9 +499,9 @@ if st.session_state.get("trigger_scrape"):
                 pid = st.session_state.get("mytour_province_id")
                 slug = st.session_state.get("mytour_city_slug", "")
                 paste_mode = st.session_state.get("mytour_paste_mode", False)
-                mt_rooms = st.session_state.get("mytour_rooms", 1)
-                mt_adults = st.session_state.get("mytour_adults", 2)
-                mt_children = st.session_state.get("mytour_children", 0)
+                mt_rooms = st.session_state.get("_mt_rooms", 1)
+                mt_adults = st.session_state.get("_mt_adults", 2)
+                mt_children = st.session_state.get("_mt_children", 0)
                 if paste_mode or pid is None:
                     # Paste mode: navigate to pasted URL, intercept all API responses
                     results = run_scrape_mytour(
