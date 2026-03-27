@@ -411,58 +411,70 @@ def _clean_tripcom_url(raw_url: str) -> str:
         return raw_url
 
 
-async def _scroll_load_all(page, destination: str, status_callback) -> list[dict]:
+async def _scroll_and_extract(page, destination: str, status_callback, page_label: str = "") -> list[dict]:
     """
-    Scroll-to-load: keep scrolling until no new hotels appear.
-    Trip.com lazy-loads hotels as user scrolls.
-    Returns deduplicated list of all visible hotels.
+    Scroll through the full page to ensure all content is rendered,
+    then extract all hotel cards in a single pass.
+    Trip.com renders hotel cards server-side (not infinite-scroll), so we
+    just need to scroll enough for lazy images/prices to populate.
     """
-    seen_ids: set[str] = set()
-    all_hotels: list[dict] = []
-    stale_rounds = 0
-
-    for i in range(40):  # max 40 scroll iterations
-        await page.evaluate("window.scrollBy(0, 800)")
+    # Phase 1: scroll to bottom repeatedly until page height stabilises
+    prev_h = 0
+    for _ in range(12):
+        h = await page.evaluate("document.body.scrollHeight")
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await asyncio.sleep(1.2)
+        new_h = await page.evaluate("document.body.scrollHeight")
+        if new_h == prev_h:
+            break
+        prev_h = new_h
 
-        payload = await page.evaluate(HOTEL_CARD_JS)
-        if isinstance(payload, dict):
-            raw = payload.get("results", [])
-        else:
-            raw = payload or []
+    # Phase 2: scroll back to top so viewport covers cards from the start
+    await page.evaluate("window.scrollTo(0, 0)")
+    await asyncio.sleep(0.5)
 
-        before = len(all_hotels)
-        for r in raw:
-            hid = r.get("hotelId", "")
-            name = r.get("name", "").strip()
-            if not hid or not name or hid in seen_ids:
-                continue
-            seen_ids.add(hid)
-            text = r.get("fullText", "")
-            link = r.get("link", "")
-            clean = _clean_card_text(text)
-            all_hotels.append({
-                "Tỉnh thành / Điểm đến": destination,
-                "Tên khách sạn": re.sub(r'\s*(Mới dùng Trip\.com|Khai trương năm \d{4}|Được nâng cấp năm \d{4})', '', name).strip(),
-                "Địa chỉ": _parse_location(clean),
-                "Hạng sao": _parse_stars(clean),
-                "Điểm đánh giá": _parse_score(clean),
-                "Gói bữa ăn": _parse_meal_plan(clean),
-                "Giá/đêm (VND)": _parse_vnd_price(clean),
-                "Chính sách hoàn hủy": _parse_cancellation(clean),
-                "Link khách sạn": link,
-            })
+    # Phase 3: single extraction pass
+    payload = await page.evaluate(HOTEL_CARD_JS)
+    if isinstance(payload, dict):
+        raw = payload.get("results", [])
+        dbg = payload.get("debug", {})
+        sel = dbg.get("usedSel", "?")
+        n_cards = dbg.get("cardCount", 0)
+        status_callback(f"  🔍 {page_label}selector='{sel}' raw_cards={n_cards} valid={len(raw)}")
+    else:
+        raw = payload or []
+        status_callback(f"  🔍 {page_label}raw_cards={len(raw)}")
 
-        if len(all_hotels) == before:
-            stale_rounds += 1
-            if stale_rounds >= 3:  # 3 scrolls with no new hotels = done
-                break
-        else:
-            stale_rounds = 0
-            if i % 5 == 0:
-                status_callback(f"  📜 Cuộn {i+1}: {len(all_hotels)} khách sạn...")
+    hotels = []
+    seen_ids: set[str] = set()
+    for r in raw:
+        hid = r.get("hotelId", "")
+        name = r.get("name", "").strip()
+        if not name:
+            continue
+        # Use link as fallback ID if card.id absent
+        key = hid or r.get("link", "") or name
+        if not key or key in seen_ids:
+            continue
+        seen_ids.add(key)
 
-    return all_hotels
+        text = r.get("fullText", "")
+        link = r.get("link", "")
+        clean = _clean_card_text(text)
+        hotels.append({
+            "Tỉnh thành / Điểm đến": destination,
+            "Tên khách sạn": re.sub(
+                r'\s*(Mới dùng Trip\.com|Khai trương năm \d{4}|Được nâng cấp năm \d{4})',
+                '', name).strip(),
+            "Địa chỉ": _parse_location(clean),
+            "Hạng sao": _parse_stars(clean),
+            "Điểm đánh giá": _parse_score(clean),
+            "Gói bữa ăn": _parse_meal_plan(clean),
+            "Giá/đêm (VND)": _parse_vnd_price(clean),
+            "Chính sách hoàn hủy": _parse_cancellation(clean),
+            "Link khách sạn": link,
+        })
+    return hotels
 
 
 async def _scrape_async(url: str, destination: str, status_callback) -> list[dict]:
@@ -529,7 +541,7 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
                     status_callback(f"⚠️ Không thể tải trang {page_idx+1}.")
                     break
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)  # Trip.com SPA needs time to render hotel cards
 
             # Detect total on first page
             if page_idx == 0:
@@ -537,8 +549,11 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
                 if total_hotels:
                     status_callback(f"📊 Trip.com: tổng ~{total_hotels} khách sạn")
 
-            # Scroll-to-load: lazy loads hotels as user scrolls down
-            page_hotels = await _scroll_load_all(page, destination, status_callback)
+            # Scroll to bottom to ensure all content renders, then extract once
+            page_hotels = await _scroll_and_extract(
+                page, destination, status_callback,
+                page_label=f"p{page_idx+1} "
+            )
 
             # Deduplicate by link (prefer) or name
             new_final = []
