@@ -772,7 +772,7 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
                         return
                     data = _json.loads(body)
                     hl = _find_hotel_list_in_json(data)
-                    if len(hl) >= 5:
+                    if len(hl) >= 10:
                         _cap["list"] = hl
                         _cap["done"] = True
                 except Exception:
@@ -800,6 +800,10 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
 
             if added > 0:
                 consecutive_empty = 0
+                # Stop early when we have collected ≥95% of declared total
+                if total_hotels and len(results) >= int(total_hotels * 0.95):
+                    status_callback(f"✅ Đã đủ {len(results)}/{total_hotels} khách sạn.")
+                    break
             else:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
@@ -811,11 +815,30 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
     return results
 
 
+def _hotel_dedup_key(h: dict) -> str:
+    """Return a stable deduplication key for a hotel.
+
+    Priority:
+    1. Numeric hotel ID extracted from any URL (consistent across DOM & API)
+    2. Full link URL
+    3. Hotel name (last resort)
+    """
+    link = h.get("Link khách sạn") or ""
+    name = h.get("Tên khách sạn") or ""
+    # Extract a long numeric ID from URL (hotel IDs are typically 5-10 digits)
+    m = re.search(r'[\-/_=](\d{5,})', link)
+    if m:
+        return f"id:{m.group(1)}"
+    if link:
+        return link
+    return name.lower().strip()
+
+
 def _add_new(hotels: list[dict], results: list[dict], seen_keys: set[str]) -> int:
     """Add hotels not yet in seen_keys to results. Returns count added."""
     added = 0
     for h in hotels:
-        key = h.get("Link khách sạn") or h.get("Tên khách sạn") or ""
+        key = _hotel_dedup_key(h)
         if key and key not in seen_keys:
             seen_keys.add(key)
             results.append(h)
