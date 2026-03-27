@@ -177,18 +177,62 @@ def _parse_location(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 HOTEL_CARD_JS = """() => {
-    const cards = document.querySelectorAll('div.hotel-card');
+    // Try multiple possible card container selectors (Trip.com changes class names)
+    const CARD_SELECTORS = [
+        'div.hotel-card',
+        'div[class*="hotel-card"]',
+        'li[class*="hotel-item"]',
+        'div[class*="hotel-item"]',
+        '[class*="hotelListItem"]',
+        '[class*="hotel-list-item"]',
+        '[data-testid*="hotel"]',
+        '[class*="propertyCard"]',
+        '[class*="HotelList"] > div',
+        '[class*="hotel_list"] > div',
+    ];
+
+    let cards = [];
+    let usedSel = '';
+    for (const sel of CARD_SELECTORS) {
+        const found = document.querySelectorAll(sel);
+        if (found.length > 0) {
+            cards = Array.from(found);
+            usedSel = sel;
+            break;
+        }
+    }
+
     const results = [];
+    const seen = new Set();
+
     cards.forEach(card => {
-        const hotelId = card.id;
-        if (!hotelId) return;
+        // Link: try hotel detail link first
+        const linkEl = card.querySelector('a[href*="/hotels/detail/"]') ||
+                       card.querySelector('a[href*="/hotel/"]') ||
+                       card.querySelector('a[href*="trip.com"]');
+        const link = linkEl ? (linkEl.href || '') : '';
+
+        // Hotel ID: from card.id, or extracted from link URL
+        let hotelId = card.id || '';
+        if (!hotelId && link) {
+            const m = link.match(/[\/\-](\d{5,})/);
+            if (m) hotelId = m[1];
+        }
+        if (!hotelId) {
+            // Use link as unique key fallback
+            if (link) hotelId = link;
+            else return;  // Skip if truly no identifier
+        }
+        if (seen.has(hotelId)) return;
+        seen.add(hotelId);
+
         const fullText = card.textContent || '';
-        
-        // Name: first meaningful text node
+
+        // Name: try structured selectors first
         const nameSelectors = [
             '[class*="hotel-name"]', '[class*="hotelName"]',
-            '[class*="name__"]', 'h2', 'h3',
-            '[class*="title"]'
+            '[class*="name__"]', 'h2', 'h3', 'h4',
+            '[class*="title"]', '[class*="hotel-title"]',
         ];
         let name = '';
         for (const sel of nameSelectors) {
@@ -198,20 +242,47 @@ HOTEL_CARD_JS = """() => {
                 break;
             }
         }
-        
-        // Link
-        const linkEl = card.querySelector('a[href*="/hotels/detail/"]');
-        const link = linkEl ? linkEl.href : '';
-        
+        if (!name && link) {
+            // Last resort: first meaningful text line
+            const lines = fullText.split('\\n').map(l => l.trim()).filter(l => l.length > 3);
+            if (lines.length) name = lines[0].substring(0, 120);
+        }
+        if (!name) return;
+
         results.push({ hotelId, name, fullText, link });
     });
-    return results;
+
+    return { results, debug: { usedSel, cardCount: cards.length } };
 }"""
 
 
-async def _extract_page_hotels(page, destination: str) -> list[dict]:
+DIAG_JS = """() => {
+    const sels = ['div.hotel-card','div[class*="hotel-card"]','div[class*="hotel-item"]',
+                  'li[class*="hotel"]','[class*="hotelListItem"]','[class*="propertyCard"]'];
+    const counts = {};
+    sels.forEach(s => { counts[s] = document.querySelectorAll(s).length; });
+    const allDivs = document.querySelectorAll('div[class]');
+    const classes = new Set();
+    allDivs.forEach(d => d.className.split(' ').forEach(c => {
+        if (c.toLowerCase().includes('hotel')) classes.add(c);
+    }));
+    return { counts, hotelClasses: Array.from(classes).slice(0, 20),
+             bodySnippet: document.body.innerText.substring(0, 300) };
+}"""
+
+
+async def _extract_page_hotels(page, destination: str, status_callback=None) -> list[dict]:
     """Extract all hotel cards visible on the current page."""
-    raw = await page.evaluate(HOTEL_CARD_JS)
+    payload = await page.evaluate(HOTEL_CARD_JS)
+    # New format: { results: [...], debug: {...} }
+    if isinstance(payload, dict):
+        raw = payload.get("results", [])
+        dbg = payload.get("debug", {})
+        if dbg and status_callback:
+            status_callback(f"🔍 DOM: selector='{dbg.get('usedSel','?')}' cards={dbg.get('cardCount',0)}")
+    else:
+        raw = payload or []
+
     hotels = []
     for r in raw:
         name = r.get("name", "").strip()
@@ -282,15 +353,52 @@ async def _detect_total_hotels(page) -> int:
 # Main scrape runner — URL-based pagination (more reliable than clicking buttons)
 # ---------------------------------------------------------------------------
 
+def _clean_tripcom_url(raw_url: str) -> str:
+    """
+    Strip marketing/filter/UI params from a Trip.com URL and rebuild a clean
+    scraper-friendly URL that renders the standard hotel list page.
+    Keeps: city/cityId, provinceId/districtId, countryId, checkin/checkout,
+           adult/children/crn, searchType, searchWord, searchValue, curr/locale.
+    Removes: listFilters, flexType, fixedDate, old, ctm_ref, searchBoxArg,
+             travelPurpose, domestic, searchCoordinate, lat/lon, etc.
+    """
+    from urllib.parse import urlparse, parse_qs, urlencode
+
+    KEEP_PARAMS = {
+        "city", "cityid", "cityname",
+        "provinceid", "districtid", "countryid",
+        "checkin", "checkout", "checkIn", "checkOut",
+        "adult", "adults", "children", "crn", "rooms",
+        "searchtype", "searchword", "searchvalue",
+        "searchname", "destname",
+        "curr", "barcurr", "locale",
+    }
+
+    try:
+        parsed = urlparse(raw_url)
+        params = parse_qs(parsed.query, keep_blank_values=False)
+        clean = {k: v for k, v in params.items() if k.lower() in KEEP_PARAMS}
+        # Ensure VND currency
+        if "curr" not in clean and "barCurr" not in clean:
+            clean["curr"] = ["VND"]
+        if "locale" not in clean:
+            clean["locale"] = ["vi-VN"]
+        new_query = urlencode({k: v[0] for k, v in clean.items()})
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+    except Exception:
+        return raw_url
+
+
 async def _scrape_async(url: str, destination: str, status_callback) -> list[dict]:
     chromium = get_chromium_path()
     if not chromium:
         raise RuntimeError("Không tìm thấy Chromium. Vui lòng cài đặt.")
 
-    # Ensure VND currency in URL
-    if 'curr=' not in url and 'barCurr=' not in url:
-        sep = '&' if '?' in url else '?'
-        url = f"{url}{sep}curr=VND&locale=vi-VN"
+    # Clean URL: remove marketing/filter params that change page rendering
+    cleaned = _clean_tripcom_url(url)
+    if cleaned != url:
+        status_callback(f"🧹 URL đã được làm sạch để tránh lỗi tải trang")
+    url = cleaned
 
     results = []
     seen_links: set[str] = set()
@@ -299,15 +407,28 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
         browser = await pw.chromium.launch(
             headless=True,
             executable_path=chromium,
-            args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage", "--no-first-run"]
+            args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--no-first-run",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1366,768",
+            ]
         )
         ctx = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1366, "height": 768},
             locale="vi-VN",
+            extra_http_headers={
+                "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            }
         )
         page = await ctx.new_page()
+        # Hide webdriver fingerprint
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
 
         status_callback("🌐 Đang mở trang Trip.com...")
         page_num = 1
@@ -341,7 +462,7 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
                 else:
                     status_callback("📄 Bắt đầu thu thập (không phát hiện được tổng số)...")
 
-            hotels = await _extract_page_hotels(page, destination)
+            hotels = await _extract_page_hotels(page, destination, status_callback)
             new = [h for h in hotels if h["Link khách sạn"] not in seen_links]
             for h in new:
                 if h["Link khách sạn"]:
@@ -356,9 +477,15 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
 
             # Stop conditions
             if len(new) == 0:
+                # Run diagnostic to understand what's on the page
+                try:
+                    diag = await page.evaluate(DIAG_JS)
+                    status_callback(f"🔍 Diagnostic: {diag.get('counts',{})} | classes: {diag.get('hotelClasses',[])} | page: {diag.get('bodySnippet','')[:150]}")
+                except Exception:
+                    pass
                 # Try once more after extra wait (sometimes lazy-loading is slow)
                 await asyncio.sleep(3)
-                hotels2 = await _extract_page_hotels(page, destination)
+                hotels2 = await _extract_page_hotels(page, destination, status_callback)
                 new2 = [h for h in hotels2 if h["Link khách sạn"] not in seen_links]
                 if not new2:
                     status_callback("⚠️ Trang không có khách sạn mới, dừng phân trang.")
