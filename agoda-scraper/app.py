@@ -192,7 +192,7 @@ if st.session_state.scrape_results:
     with col_m1:
         st.metric("🏨 Tổng số khách sạn", len(df))
     with col_m2:
-        st.metric("💰 Có dữ liệu giá", df["Giá thấp nhất (đã gồm thuế & phí)"].astype(bool).sum())
+        st.metric("💰 Có dữ liệu giá", df["Giá thấp nhất (chưa gồm thuế)"].astype(bool).sum())
     with col_m3:
         st.metric("⭐ Có hạng sao", df["Hạng sao"].astype(bool).sum())
     with col_m4:
