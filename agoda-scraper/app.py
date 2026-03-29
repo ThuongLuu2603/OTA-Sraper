@@ -3,7 +3,7 @@ import pandas as pd
 import io
 import re
 import traceback
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse
 from datetime import date, timedelta
 from scraper import build_agoda_url, run_scrape
 from scraper_tripcom import build_tripcom_url, resolve_trip_city, run_scrape_tripcom
@@ -12,6 +12,14 @@ from scraper_travelcomvn import build_travel_url, resolve_travel_city, run_scrap
 from scraper_ivivu import run_scrape_ivivu, resolve_ivivu_region_url
 from scraper_findtourgo import build_findtourgo_url, run_scrape_findtourgo_tours
 from scraper_travelcomvn_tour import build_travel_tour_url, resolve_travel_tour_slug, run_scrape_travel_tour
+from market_db import (
+    db_ready,
+    init_db,
+    replace_case_source,
+    list_hotel_cases,
+    build_cross_channel_compare,
+    get_case_rows,
+)
 
 st.set_page_config(
     page_title="OTA Hotel Scraper",
@@ -113,6 +121,114 @@ def normalize_hotel_rows(rows: list, source: str, destination: str) -> list:
         }
         out.append(normalized)
     return out
+
+
+def _norm_destination_key(text: str) -> str:
+    txt = (text or "").strip().lower()
+    replacements = {
+        "đ": "d", "á": "a", "à": "a", "ả": "a", "ã": "a", "ạ": "a",
+        "ă": "a", "ắ": "a", "ằ": "a", "ẳ": "a", "ẵ": "a", "ặ": "a",
+        "â": "a", "ấ": "a", "ầ": "a", "ẩ": "a", "ẫ": "a", "ậ": "a",
+        "é": "e", "è": "e", "ẻ": "e", "ẽ": "e", "ẹ": "e",
+        "ê": "e", "ế": "e", "ề": "e", "ể": "e", "ễ": "e", "ệ": "e",
+        "í": "i", "ì": "i", "ỉ": "i", "ĩ": "i", "ị": "i",
+        "ó": "o", "ò": "o", "ỏ": "o", "õ": "o", "ọ": "o",
+        "ô": "o", "ố": "o", "ồ": "o", "ổ": "o", "ỗ": "o", "ộ": "o",
+        "ơ": "o", "ớ": "o", "ờ": "o", "ở": "o", "ỡ": "o", "ợ": "o",
+        "ú": "u", "ù": "u", "ủ": "u", "ũ": "u", "ụ": "u",
+        "ư": "u", "ứ": "u", "ừ": "u", "ử": "u", "ữ": "u", "ự": "u",
+        "ý": "y", "ỳ": "y", "ỷ": "y", "ỹ": "y", "ỵ": "y",
+    }
+    for src, dst in replacements.items():
+        txt = txt.replace(src, dst)
+    txt = re.sub(r"[^a-z0-9]+", "-", txt).strip("-")
+    return txt or "unknown"
+
+
+def _normalize_date_text(raw: str) -> str:
+    txt = (raw or "").strip()
+    if not txt:
+        return ""
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", txt):
+        return txt
+    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", txt)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", txt)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    return txt
+
+
+def _extract_hotel_case_info(active_source: str, active_url: str, active_destination: str) -> dict:
+    parsed = urlparse(active_url or "")
+    qs = parse_qs(parsed.query or "")
+    checkin = ""
+    checkout = ""
+    rooms = 1
+    adults = 2
+    children = 0
+
+    def to_int(v: str, default: int) -> int:
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return default
+
+    def q(*keys: str, default: str = "") -> str:
+        for k in keys:
+            v = qs.get(k)
+            if v and v[0]:
+                return v[0]
+        return default
+
+    if active_source == "Agoda":
+        checkin = q("checkIn")
+        checkout = q("checkOut")
+        rooms = to_int(q("rooms", default="1") or "1", 1)
+        adults = to_int(q("adults", default="2") or "2", 2)
+        children = to_int(q("children", default="0") or "0", 0)
+    elif active_source == "Trip.com":
+        checkin = q("checkIn", "checkin")
+        checkout = q("checkOut", "checkout")
+        rooms = to_int(q("crn", "room", default="1") or "1", 1)
+        adults = to_int(q("adult", "adults", default="2") or "2", 2)
+        children = to_int(q("children", default="0") or "0", 0)
+    elif active_source == "Mytour.vn":
+        checkin = q("checkIn")
+        checkout = q("checkOut")
+        rooms = to_int(q("rooms", default="1") or "1", 1)
+        adults = to_int(q("adults", default="2") or "2", 2)
+        children = to_int(q("children", default="0") or "0", 0)
+    elif active_source == "Travel.com.vn":
+        checkin = q("in")
+        checkout = q("out")
+        rooms = to_int(q("room", default="1") or "1", 1)
+        adults = to_int(q("adults", default="2") or "2", 2)
+        children = to_int(q("children", default="0") or "0", 0)
+    elif active_source == "iVIVU":
+        checkin = st.session_state.get("_iv_checkin", "")
+        checkout = st.session_state.get("_iv_checkout", "")
+        rooms = int(st.session_state.get("_iv_rooms", 1) or 1)
+        adults = int(st.session_state.get("_iv_adults", 2) or 2)
+        children = int(st.session_state.get("_iv_children", 0) or 0)
+
+    checkin = _normalize_date_text(checkin)
+    checkout = _normalize_date_text(checkout)
+    destination = (active_destination or "").strip()
+    case_key = (
+        f"hotel|{_norm_destination_key(destination)}|{checkin}|{checkout}|"
+        f"{rooms}|{adults}|{children}|vnd"
+    )
+    return {
+        "case_key": case_key,
+        "destination": destination,
+        "checkin": checkin,
+        "checkout": checkout,
+        "rooms": rooms,
+        "adults": adults,
+        "children": children,
+    }
 
 st.markdown("""
 <style>
@@ -324,11 +440,17 @@ for key, default in [
     ("scrape_results", None), ("is_scraping", False),
     ("active_destination", ""), ("active_url", ""),
     ("active_segment", "Hotel"), ("active_source", "Agoda"),
+    ("active_case_key", ""), ("compare_df", None),
+    ("global_compare_df", None),
     ("trigger_scrape", False), ("trip_city_info", None),
-    ("mytour_city_info", None), ("check_in_str", ""), ("check_out_str", ""),
+    ("mytour_city_info", None),     ("check_in_str", ""), ("check_out_str", ""),
+    ("hotel_compare_on", False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+init_db()
+DB_OK, DB_INFO = db_ready()
 
 today = date.today()
 
@@ -344,14 +466,32 @@ with st.sidebar:
     )
     segment_name = segment.split(" ", 1)[1]
     st.markdown("---")
+    hotel_selection_name = "Agoda"
     if segment_name == "Hotel":
-        ota = st.radio(
-            "Chọn OTA Hotel",
+
+        def _clear_hotel_compare():
+            st.session_state.hotel_compare_on = False
+
+        hotel_ota_pick = st.radio(
+            "Chọn OTA / Công cụ",
             ["🟠 Agoda", "🔵 Trip.com", "🟢 Mytour.vn", "🟣 Travel.com.vn", "🟡 iVIVU"],
             horizontal=False,
-            key="ota_radio",
+            key="hotel_ota_radio",
+            on_change=_clear_hotel_compare,
         )
-        ota_name = ota.split(" ", 1)[1]
+        st.divider()
+        if st.button(
+            "🧮 So sánh đa kênh",
+            use_container_width=True,
+            type="primary" if st.session_state.hotel_compare_on else "secondary",
+        ):
+            st.session_state.hotel_compare_on = True
+
+        if st.session_state.hotel_compare_on:
+            hotel_selection_name = "So sánh đa kênh"
+        else:
+            hotel_selection_name = hotel_ota_pick.split(" ", 1)[1]
+        ota_name = hotel_selection_name
     else:
         tour_source = st.radio(
             "Chọn nguồn Tour",
@@ -362,12 +502,16 @@ with st.sidebar:
         ota = tour_source
         ota_name = tour_source.split(" ", 1)[1]
 
+compare_tool_mode = segment_name == "Hotel" and hotel_selection_name == "So sánh đa kênh"
+
 # Clear results if selector changed
 selector_key = f"{segment_name}:{ota_name}"
 if "prev_selector" not in st.session_state:
     st.session_state.prev_selector = selector_key
 if st.session_state.prev_selector != selector_key:
     st.session_state.scrape_results = None
+    st.session_state.compare_df = None
+    st.session_state.global_compare_df = None
     st.session_state.prev_selector = selector_key
 
 hero_class = {
@@ -377,6 +521,7 @@ hero_class = {
     "Travel.com.vn": "hero-travel",
     "iVIVU": "hero-ivivu",
     "FindTourGo": "hero-tripcom",
+    "So sánh đa kênh": "hero-tripcom",
 }[ota_name]
 ota_class = {
     "Agoda": "ota-agoda",
@@ -385,6 +530,7 @@ ota_class = {
     "Travel.com.vn": "ota-travel",
     "iVIVU": "ota-ivivu",
     "FindTourGo": "ota-tripcom",
+    "So sánh đa kênh": "ota-tripcom",
 }[ota_name]
 
 logo_map = {
@@ -394,6 +540,7 @@ logo_map = {
     "Travel.com.vn": "🟣",
     "iVIVU": "🟡",
     "FindTourGo": "🧭",
+    "So sánh đa kênh": "🧮",
 }
 title_suffix = "Hotel Scraper" if segment_name == "Hotel" else "Tour Scraper"
 subtitle = (
@@ -401,9 +548,13 @@ subtitle = (
     if segment_name == "Hotel"
     else "Thu thập dữ liệu tour · Lấy ngày khởi hành · Xuất Excel / CSV"
 )
+if compare_tool_mode:
+    title_suffix = ""
+    subtitle = "Chọn case trong DB để so sánh giá giữa các OTA · Tải Excel / CSV"
+hero_title = f"{logo_map[ota_name]} {ota_name} {title_suffix}".strip()
 st.markdown(f"""
 <div class="hero {hero_class}">
-  <h1>{logo_map[ota_name]} {ota_name} {title_suffix}</h1>
+  <h1>{hero_title}</h1>
   <p>{subtitle}</p>
 </div>
 """, unsafe_allow_html=True)
@@ -411,7 +562,9 @@ st.markdown(f"""
 st.markdown(f"<div class='{ota_class}'>", unsafe_allow_html=True)
 
 # ── TOUR SOURCES ────────────────────────────────────────────────────────────
-if segment_name == "Tour":
+if compare_tool_mode:
+    pass
+elif segment_name == "Tour":
     if ota_name == "FindTourGo":
         tab_f1, tab_f2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
 
@@ -1078,8 +1231,114 @@ elif ota_name == "iVIVU":
 
 st.markdown("</div>", unsafe_allow_html=True)
 
+# ── Hotel DB case viewer for current source ─────────────────────────────────
+if segment_name == "Hotel" and compare_tool_mode:
+    st.markdown("#### 🧮 Công cụ so sánh đa kênh")
+    if not DB_OK:
+        st.warning(
+            "Chưa cấu hình Supabase DB. Vào Streamlit Secrets và thêm DATABASE_URL "
+            "hoặc SUPABASE_DB_HOST/PORT/NAME/USER/PASSWORD."
+        )
+    else:
+        st.caption(f"DB: {DB_INFO}")
+        all_case_rows = list_hotel_cases(limit=300)
+        if not all_case_rows:
+            st.caption("Chưa có case nào trong DB.")
+        else:
+            cmp_options = []
+            cmp_map = {}
+            for c in all_case_rows:
+                label = (
+                    f"{c.get('destination','')} | {c.get('checkin','')}→{c.get('checkout','')} | "
+                    f"{c.get('source_count',0)} nguồn"
+                )
+                cmp_options.append(label)
+                cmp_map[label] = c.get("case_key", "")
+
+            selected_cmp_label = st.selectbox(
+                "Case để so sánh",
+                cmp_options,
+                key="sidebar_tool_compare_case_picker",
+            )
+            selected_cmp_case = cmp_map.get(selected_cmp_label, "")
+
+            if st.button("🔎 So sánh", key="sidebar_tool_compare_btn", use_container_width=True, type="primary"):
+                cmp_rows = build_cross_channel_compare(selected_cmp_case)
+                st.session_state.global_compare_df = pd.DataFrame(cmp_rows) if cmp_rows else pd.DataFrame()
+
+            gdf = st.session_state.get("global_compare_df")
+            if isinstance(gdf, pd.DataFrame):
+                if not gdf.empty:
+                    st.markdown("#### 📊 Bảng so sánh giá đa kênh")
+                    st.dataframe(gdf, use_container_width=True, height=420)
+
+                    c1, c2 = st.columns(2, gap="medium")
+                    with c1:
+                        out_cmp = io.BytesIO()
+                        with pd.ExcelWriter(out_cmp, engine="openpyxl") as writer:
+                            gdf.to_excel(writer, index=False, sheet_name="SoSanhDaKenh")
+                        out_cmp.seek(0)
+                        st.download_button(
+                            label="📊 Tải Excel so sánh",
+                            data=out_cmp.getvalue(),
+                            file_name="so_sanh_da_kenh.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                    with c2:
+                        cmp_csv = gdf.to_csv(index=False, encoding="utf-8-sig")
+                        st.download_button(
+                            label="📄 Tải CSV so sánh",
+                            data=cmp_csv.encode("utf-8-sig"),
+                            file_name="so_sanh_da_kenh.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                else:
+                    st.info("Case này chưa đủ dữ liệu từ >=2 nguồn để so sánh.")
+elif segment_name == "Hotel":
+    with st.expander(f"🗂️ Xem lại case DB của {ota_name}", expanded=False):
+        if not DB_OK:
+            st.warning(
+                "Chưa cấu hình Supabase DB. Vào Streamlit Secrets và thêm DATABASE_URL "
+                "hoặc SUPABASE_DB_HOST/PORT/NAME/USER/PASSWORD."
+            )
+        else:
+            source_cases = list_hotel_cases(limit=300, source=ota_name)
+            if not source_cases:
+                st.caption(f"Chưa có case nào của kênh {ota_name} trong DB.")
+            else:
+                options = []
+                case_meta_map = {}
+                for c in source_cases:
+                    label = (
+                        f"{c.get('destination','')} | {c.get('checkin','')}→{c.get('checkout','')} | "
+                        f"{c.get('rooms',1)}R-{c.get('adults',2)}A-{c.get('children',0)}C | "
+                        f"cập nhật: {c.get('updated_at','')}"
+                    )
+                    options.append(label)
+                    case_meta_map[label] = c
+
+                selected_label = st.selectbox("Case đã lưu của kênh này", options, key=f"case_picker_{ota_name}")
+                selected_case = case_meta_map.get(selected_label, {})
+                selected_case_key = selected_case.get("case_key", "")
+                st.caption(f"Case key: `{selected_case_key}`")
+
+                if st.button("📥 Nạp lại case vào bảng kết quả", key=f"load_case_{ota_name}", use_container_width=True):
+                    loaded_rows = get_case_rows(selected_case_key, ota_name)
+                    if loaded_rows:
+                        st.session_state.scrape_results = loaded_rows
+                        st.session_state.active_destination = selected_case.get("destination", "")
+                        st.session_state.active_segment = "Hotel"
+                        st.session_state.active_source = ota_name
+                        st.session_state.active_case_key = selected_case_key
+                        st.success(f"Đã nạp {len(loaded_rows)} dòng từ DB.")
+                        st.rerun()
+                    else:
+                        st.warning("Case này không có dữ liệu chi tiết để nạp.")
+
 # ── Scraping ──────────────────────────────────────────────────────────────────
-if st.session_state.get("trigger_scrape"):
+if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
     st.session_state["trigger_scrape"] = False
     st.session_state.is_scraping = True
     st.session_state.scrape_results = None
@@ -1173,6 +1432,20 @@ if st.session_state.get("trigger_scrape"):
 
     st.session_state.is_scraping = False
 
+    # Persist hotel snapshots with "replace same case + same source" rule.
+    if active_segment == "Hotel" and results:
+        try:
+            case_info = _extract_hotel_case_info(active_source, active_url, active_destination)
+            saved_count = replace_case_source(case_info, active_source, results)
+            st.session_state.active_case_key = case_info["case_key"]
+            status_messages.append(
+                f"💾 DB: cập nhật case={case_info['case_key']} | source={active_source} | rows={saved_count}"
+            )
+        except Exception as db_err:
+            status_messages.append(f"⚠️ DB save lỗi: {type(db_err).__name__}: {db_err}")
+    elif active_segment == "Hotel":
+        st.session_state.active_case_key = _extract_hotel_case_info(active_source, active_url, active_destination)["case_key"]
+
     if status_messages:
         with st.expander("📋  Nhật ký chi tiết"):
             for msg in status_messages:
@@ -1185,7 +1458,7 @@ if st.session_state.get("trigger_scrape"):
         st.warning(f"⚠️  Không tìm thấy dữ liệu. Hãy thử lại hoặc chọn điểm đến khác.")
 
 # ── Results ──────────────────────────────────────────────────────────────────
-if st.session_state.scrape_results:
+if (not compare_tool_mode) and st.session_state.scrape_results:
     results = st.session_state.scrape_results
     df = pd.DataFrame(results)
     active_destination = st.session_state.get("active_destination", "data")
@@ -1351,6 +1624,7 @@ if st.session_state.scrape_results:
     with dl3:
         if st.button("🗑️  Xóa & tìm lại", use_container_width=True):
             st.session_state.scrape_results = None
+            st.session_state.compare_df = None
             st.rerun()
 
 st.markdown("""
