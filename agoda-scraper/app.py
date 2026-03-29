@@ -449,10 +449,16 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
-init_db()
-DB_OK, DB_INFO = db_ready()
+DB_CFG_OK, DB_INFO = db_ready()
+_db_init_ok, _db_init_msg = init_db()
+DB_OK = DB_CFG_OK and _db_init_ok
+if DB_CFG_OK and not _db_init_ok:
+    DB_INFO = _db_init_msg
 
 today = date.today()
+
+if DB_CFG_OK and not _db_init_ok:
+    st.warning(_db_init_msg)
 
 # ── Segment + source selector ───────────────────────────────────────────────
 with st.sidebar:

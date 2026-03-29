@@ -30,18 +30,41 @@ def _safe_streamlit_secrets() -> dict:
         return {}
 
 
+def _secret_str(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
 def _db_config() -> dict:
     secrets = _safe_streamlit_secrets()
     cfg = {
-        "database_url": os.getenv("DATABASE_URL") or secrets.get("DATABASE_URL", ""),
-        "host": os.getenv("SUPABASE_DB_HOST") or secrets.get("SUPABASE_DB_HOST", ""),
-        "port": os.getenv("SUPABASE_DB_PORT") or secrets.get("SUPABASE_DB_PORT", ""),
-        "dbname": os.getenv("SUPABASE_DB_NAME") or secrets.get("SUPABASE_DB_NAME", ""),
-        "user": os.getenv("SUPABASE_DB_USER") or secrets.get("SUPABASE_DB_USER", ""),
-        "password": os.getenv("SUPABASE_DB_PASSWORD") or secrets.get("SUPABASE_DB_PASSWORD", ""),
-        "sslmode": os.getenv("SUPABASE_DB_SSLMODE") or secrets.get("SUPABASE_DB_SSLMODE", "require"),
+        "database_url": _secret_str(os.getenv("DATABASE_URL") or secrets.get("DATABASE_URL", "")),
+        "host": _secret_str(os.getenv("SUPABASE_DB_HOST") or secrets.get("SUPABASE_DB_HOST", "")),
+        "port": _secret_str(os.getenv("SUPABASE_DB_PORT") or secrets.get("SUPABASE_DB_PORT", "")),
+        "dbname": _secret_str(os.getenv("SUPABASE_DB_NAME") or secrets.get("SUPABASE_DB_NAME", "")),
+        "user": _secret_str(os.getenv("SUPABASE_DB_USER") or secrets.get("SUPABASE_DB_USER", "")),
+        "password": _secret_str(os.getenv("SUPABASE_DB_PASSWORD") or secrets.get("SUPABASE_DB_PASSWORD", "")),
+        "sslmode": _secret_str(os.getenv("SUPABASE_DB_SSLMODE") or secrets.get("SUPABASE_DB_SSLMODE", "require")) or "require",
+        "connect_timeout": _secret_str(
+            os.getenv("SUPABASE_DB_CONNECT_TIMEOUT") or secrets.get("SUPABASE_DB_CONNECT_TIMEOUT", "15")
+        )
+        or "15",
     }
     return cfg
+
+
+def _normalize_database_url(url: str) -> str:
+    u = url.strip()
+    if not u:
+        return u
+    if u.startswith("postgres://"):
+        u = "postgresql://" + u[len("postgres://") :]
+    if "sslmode=" not in u and "?" not in u:
+        return u + "?sslmode=require"
+    if "sslmode=" not in u and "?" in u:
+        return u + "&sslmode=require"
+    return u
 
 
 def db_ready() -> tuple[bool, str]:
@@ -60,8 +83,13 @@ def get_conn():
     if not ok:
         raise RuntimeError(f"Supabase DB chưa cấu hình: {msg}")
     cfg = _db_config()
+    try:
+        timeout = max(5, int(cfg["connect_timeout"] or "15"))
+    except ValueError:
+        timeout = 15
     if cfg["database_url"]:
-        return psycopg2.connect(cfg["database_url"], cursor_factory=RealDictCursor)
+        dsn = _normalize_database_url(cfg["database_url"])
+        return psycopg2.connect(dsn, cursor_factory=RealDictCursor, connect_timeout=timeout)
     return psycopg2.connect(
         host=cfg["host"],
         port=int(cfg["port"]),
@@ -69,6 +97,7 @@ def get_conn():
         user=cfg["user"],
         password=cfg["password"],
         sslmode=cfg["sslmode"],
+        connect_timeout=timeout,
         cursor_factory=RealDictCursor,
     )
 
@@ -77,8 +106,9 @@ def init_db() -> tuple[bool, str]:
     ok, msg = db_ready()
     if not ok:
         return False, msg
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -123,8 +153,21 @@ def init_db() -> tuple[bool, str]:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_case_source ON hotel_snapshot(case_key, source)")
         conn.commit()
         return True, msg
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        hint = (
+            " (Streamlit Cloud: thử DATABASE_URL pooler port 6543 từ Supabase → Connect → "
+            "Transaction pooler, hoặc bật IPv4 add-on nếu dùng host db.*.supabase.co:5432)"
+        )
+        err_head = str(e).strip().split("\n")[0][:220]
+        return False, f"Không kết nối/khởi tạo DB: {type(e).__name__}: {err_head}{hint}"
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def _to_ascii(text: str) -> str:
