@@ -3,6 +3,7 @@ import pandas as pd
 import io
 import re
 import traceback
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from datetime import date, timedelta
 from scraper import build_agoda_url, run_scrape
 from scraper_tripcom import build_tripcom_url, resolve_trip_city, run_scrape_tripcom
@@ -15,6 +16,24 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+
+def normalize_agoda_direct_url(raw_url: str) -> str:
+    """
+    Normalize pasted Agoda URL to broad search mode.
+    We force `productType=-1` to avoid narrow inventory subsets (e.g. productType=2).
+    """
+    try:
+        parsed = urlparse(raw_url.strip())
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        params["productType"] = "-1"
+        params["currency"] = "VND"
+        params["currencyCode"] = "VND"
+        params["priceCur"] = "VND"
+        new_query = urlencode(params, doseq=True)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+    except Exception:
+        return raw_url.strip()
 
 st.markdown("""
 <style>
@@ -280,10 +299,7 @@ if ota_name == "Agoda":
         if st.button("🚀  Bắt đầu thu thập",
                      disabled=not direct_url.strip() or not dest_url_tab.strip() or st.session_state.is_scraping,
                      key="agoda_url_btn", use_container_width=True, type="primary"):
-            pasted = direct_url.strip()
-            if "currency=VND" not in pasted:
-                sep = "&" if "?" in pasted else "?"
-                pasted += f"{sep}currency=VND&currencyCode=VND&priceCur=VND"
+            pasted = normalize_agoda_direct_url(direct_url)
             st.session_state.update({"active_url": pasted, "active_destination": dest_url_tab.strip(), "trigger_scrape": True})
 
 # ── TRIP.COM ─────────────────────────────────────────────────────────────────

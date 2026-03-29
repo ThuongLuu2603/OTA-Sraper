@@ -133,6 +133,98 @@ def _safe_get(d, *keys, default=None):
     return d if d is not None else default
 
 
+def _collect_city_search_nodes(data) -> list[dict]:
+    """Recursively collect all `citySearch` dict nodes from a JSON payload."""
+    found: list[dict] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            cs = node.get("citySearch")
+            if isinstance(cs, dict):
+                found.append(cs)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    return found
+
+
+def _extract_total_pages_from_city_search(city_search: dict, fallback_pages: int = 1) -> int:
+    """
+    Derive total pages from citySearch metadata if available.
+    Falls back to provided value when metadata is absent.
+    """
+    candidate_page_keys = ("totalPage", "totalPages", "pageCount", "pages", "lastPage")
+    candidate_total_keys = ("totalCount", "totalResults", "resultCount", "hotelCount", "propertyCount")
+    candidate_size_keys = ("pageSize", "size", "perPage", "itemsPerPage")
+
+    explicit_pages = 0
+    total_items = 0
+    page_size = 0
+
+    stack = [city_search]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                lk = k.lower()
+                if isinstance(v, (int, float)):
+                    iv = int(v)
+                    if lk in (x.lower() for x in candidate_page_keys) and iv > explicit_pages:
+                        explicit_pages = iv
+                    if lk in (x.lower() for x in candidate_total_keys) and iv > total_items:
+                        total_items = iv
+                    if lk in (x.lower() for x in candidate_size_keys) and iv > page_size:
+                        page_size = iv
+                elif isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(node)
+
+    if explicit_pages > 0:
+        return max(explicit_pages, fallback_pages)
+    if total_items > 0 and page_size > 0:
+        return max((total_items + page_size - 1) // page_size, fallback_pages)
+    return fallback_pages
+
+
+def _extract_properties_from_city_search(city_search: dict) -> list[dict]:
+    """
+    Extract Agoda property records from known and fallback locations in citySearch.
+    """
+    result: list[dict] = []
+    known_keys = ("properties", "featuredProperties", "otherProperties", "sponsoredProperties")
+    for key in known_keys:
+        val = city_search.get(key)
+        if isinstance(val, list):
+            result.extend([x for x in val if isinstance(x, dict)])
+
+    if result:
+        return result
+
+    # Fallback: recursively scan for objects that look like Agoda property nodes.
+    seen = set()
+    stack = [city_search]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if isinstance(node.get("content"), dict) and isinstance(node.get("pricing"), dict):
+                pid = _safe_get(node, "content", "informationSummary", "propertyId", default=None)
+                key = str(pid) if pid is not None else str(id(node))
+                if key not in seen:
+                    seen.add(key)
+                    result.append(node)
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return result
+
+
 def _collect_prices(hotel: dict) -> list[dict]:
     """
     Collect all (exclusive, inclusive, currency) price entries from all offers.
@@ -377,14 +469,19 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
         gql_queue: asyncio.Queue = asyncio.Queue()
 
         async def on_response(response):
-            if "graphql/search" in response.url:
-                try:
-                    body = await response.text()
-                    data = json.loads(body)
-                    if "citySearch" in data.get("data", {}):
-                        await gql_queue.put(data["data"]["citySearch"])
-                except Exception:
-                    pass
+            ct = (response.headers.get("content-type") or "").lower()
+            if "json" not in ct:
+                return
+            try:
+                body = await response.text()
+                if "citySearch" not in body:
+                    return
+                data = json.loads(body)
+                nodes = _collect_city_search_nodes(data)
+                for node in nodes:
+                    await gql_queue.put(node)
+            except Exception:
+                pass
 
         page.on("response", on_response)
 
@@ -405,13 +502,16 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
                 return results
 
             total_pages = await get_total_pages(page)
+            total_pages = _extract_total_pages_from_city_search(city_search_data, total_pages)
             if status_callback:
                 status_callback(f"Tìm thấy {total_pages} trang kết quả. Bắt đầu thu thập dữ liệu nhanh...")
 
             current_page = 1
+            seen_property_ids: set[str] = set()
 
             while True:
-                properties = city_search_data.get("properties", [])
+                properties = _extract_properties_from_city_search(city_search_data)
+                total_pages = _extract_total_pages_from_city_search(city_search_data, total_pages)
                 if status_callback:
                     status_callback(
                         f"📄 Trang {current_page}/{total_pages} — "
@@ -419,6 +519,12 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
                     )
 
                 for hotel in properties:
+                    pid = _safe_get(hotel, "content", "informationSummary", "propertyId", default=None)
+                    if pid is not None:
+                        pid_key = str(pid)
+                        if pid_key in seen_property_ids:
+                            continue
+                        seen_property_ids.add(pid_key)
                     record = parse_hotel_from_graphql(hotel, destination)
                     if record:
                         results.append(record)
