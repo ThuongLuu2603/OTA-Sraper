@@ -798,6 +798,37 @@ def _sim(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+# Điểm dưới ngưỡng → không coi là match (tránh ghép sai như Paris ↔ HERO Hostel).
+MIN_CROSS_CHANNEL_MATCH_SCORE = 0.62
+
+
+def _name_pair_score(na: str, nb: str) -> float:
+    """
+    Kết hợp SequenceMatcher + Jaccard trên token (tên đã normalize),
+    bonus khi tập token của một bên là con của bên kia (vd. 'phi mai' ⊂ 'phi mai an giang').
+    """
+    na = (na or "").strip()
+    nb = (nb or "").strip()
+    if not na or not nb:
+        return 0.0
+    seq = SequenceMatcher(None, na, nb).ratio()
+    t1 = {x for x in na.split() if x}
+    t2 = {x for x in nb.split() if x}
+    if not t1 or not t2:
+        return seq
+    inter = t1 & t2
+    union = t1 | t2
+    jacc = len(inter) / len(union) if union else 0.0
+    core = 0.48 * seq + 0.52 * jacc
+    if t1 <= t2 or t2 <= t1:
+        core = min(1.0, core + 0.14)
+    elif len(inter) >= 2 and inter:
+        sm = min(len(t1), len(t2))
+        if sm > 0 and len(inter) / sm >= 0.67:
+            core = min(1.0, core + 0.07)
+    return min(1.0, core)
+
+
 def _star_bonus(a: float | None, b: float | None) -> float:
     if a is None or b is None:
         return 0.0
@@ -814,7 +845,7 @@ def _star_bonus(a: float | None, b: float | None) -> float:
 def pair_score(base: dict, cand: dict) -> float:
     # Agoda often has weak/empty address -> rely mainly on name.
     agoda_mode = base.get("source") == "Agoda" or cand.get("source") == "Agoda"
-    name_sc = _sim(base.get("hotel_name_norm", ""), cand.get("hotel_name_norm", ""))
+    name_sc = _name_pair_score(base.get("hotel_name_norm", ""), cand.get("hotel_name_norm", ""))
     addr_sc = _sim(base.get("address_norm", ""), cand.get("address_norm", ""))
     if agoda_mode:
         total = 0.90 * name_sc + 0.10 * max(addr_sc, 0.0)
@@ -822,6 +853,46 @@ def pair_score(base: dict, cand: dict) -> float:
         total = 0.75 * name_sc + 0.25 * addr_sc
     total += _star_bonus(base.get("star_num"), cand.get("star_num"))
     return max(0.0, min(1.0, total))
+
+
+def _greedy_one_to_one(
+    base_rows: list[dict],
+    cand_rows: list[dict],
+    min_score: float,
+) -> tuple[dict[int, tuple[dict, float]], set[int]]:
+    """
+    Mỗi khách sạn phía candidate chỉ gán cho tối đa một dòng base (tránh iVIVU bị lặp cho nhiều Agoda).
+    Duyệt cạnh theo điểm giảm dần, bỏ qua nếu đã khớp.
+    """
+    edges: list[tuple[float, int, int]] = []
+    for i, b in enumerate(base_rows):
+        for j, c in enumerate(cand_rows):
+            sc = pair_score(b, c)
+            edges.append((sc, i, j))
+    edges.sort(key=lambda x: x[0], reverse=True)
+    used_b: set[int] = set()
+    used_c: set[int] = set()
+    out: dict[int, tuple[dict, float]] = {}
+    for sc, i, j in edges:
+        if sc < min_score:
+            break
+        if i in used_b or j in used_c:
+            continue
+        used_b.add(i)
+        used_c.add(j)
+        out[i] = (cand_rows[j], sc)
+    return out, used_c
+
+
+def _pick_base_source(available: list[str], by_source: dict[str, list]) -> str:
+    """Nguồn có nhiều bản ghi nhất làm trục so sánh; hòa thì ưu tiên thứ tự (tránh mặc định Agoda)."""
+    best_n = max(len(by_source[s]) for s in available)
+    cand = [s for s in available if len(by_source[s]) == best_n]
+    tie_pref = ["Travel.com.vn", "Trip.com", "Mytour.vn", "iVIVU", "Agoda"]
+    for o in tie_pref:
+        if o in cand:
+            return o
+    return cand[0]
 
 
 def build_cross_channel_compare(case_key: str) -> list[dict]:
@@ -837,11 +908,28 @@ def build_cross_channel_compare(case_key: str) -> list[dict]:
     if len(available) < 2:
         return []
 
-    base_source = "Travel.com.vn" if "Travel.com.vn" in by_source else available[0]
+    base_source = _pick_base_source(available, by_source)
     base_rows = by_source[base_source]
 
-    result = []
-    for b in base_rows:
+    # Gán 1–1 giữa base và từng nguồn khác (mỗi KS phía đối chỉ dùng một lần).
+    assign_per_src: dict[str, dict[int, tuple[dict, float]]] = {}
+    used_cand_per_src: dict[str, set[int]] = {}
+    for src in available:
+        if src == base_source:
+            continue
+        cands = by_source.get(src, [])
+        if not cands:
+            assign_per_src[src] = {}
+            used_cand_per_src[src] = set()
+        else:
+            assign, used_j = _greedy_one_to_one(
+                base_rows, cands, MIN_CROSS_CHANNEL_MATCH_SCORE
+            )
+            assign_per_src[src] = assign
+            used_cand_per_src[src] = used_j
+
+    result: list[dict] = []
+    for idx, b in enumerate(base_rows):
         out = {
             "Case key": case_key,
             "Hotel chuẩn": b.get("hotel_name", ""),
@@ -860,20 +948,24 @@ def build_cross_channel_compare(case_key: str) -> list[dict]:
                 continue
             best = None
             best_sc = -1.0
-            for c in by_source.get(src, []):
-                sc = pair_score(b, c)
-                if sc > best_sc:
-                    best_sc = sc
-                    best = c
+            pair = assign_per_src.get(src, {}).get(idx)
+            if pair:
+                best, best_sc = pair
             match_name = best.get("hotel_name", "") if best else ""
             match_price = best.get("price_vnd_num") if best else None
             out[f"Match {src}"] = match_name
-            out[f"Score {src}"] = f"{best_sc*100:.0f}" if best and best_sc >= 0 else ""
+            out[f"Score {src}"] = f"{best_sc * 100:.0f}" if best and best_sc >= MIN_CROSS_CHANNEL_MATCH_SCORE else ""
             out[f"Giá {src}"] = int(match_price) if isinstance(match_price, (int, float)) else ""
 
             if isinstance(match_price, (int, float)) and match_price > 0:
                 prices.append((src, float(match_price)))
-            if isinstance(base_price, (int, float)) and base_price > 0 and isinstance(match_price, (int, float)) and match_price > 0:
+            if (
+                isinstance(base_price, (int, float))
+                and base_price > 0
+                and isinstance(match_price, (int, float))
+                and match_price > 0
+                and best
+            ):
                 gap_pct = ((match_price - base_price) / base_price) * 100.0
                 out[f"Chênh {src} vs {base_source} (%)"] = f"{gap_pct:+.1f}%"
             else:
@@ -887,7 +979,54 @@ def build_cross_channel_compare(case_key: str) -> list[dict]:
             out["Kênh rẻ nhất"] = ""
             out["Giá rẻ nhất"] = ""
 
+        note_parts = []
+        for src in available:
+            if src == base_source:
+                continue
+            if not assign_per_src.get(src, {}).get(idx):
+                note_parts.append(f"không khớp {src}")
+        out["Ghi chú"] = "; ".join(note_parts) if note_parts else ""
+
         result.append(out)
+
+    # Khách sạn chỉ có trên kênh khác (không được ghép 1–1 với base) — vẫn hiện một dòng riêng.
+    for src in available:
+        if src == base_source:
+            continue
+        cands = by_source.get(src, [])
+        used_j = used_cand_per_src.get(src, set())
+        for j, c in enumerate(cands):
+            if j in used_j:
+                continue
+            out = {
+                "Case key": case_key,
+                "Hotel chuẩn": c.get("hotel_name", ""),
+                "Nguồn chuẩn": src,
+                "Link chuẩn": c.get("hotel_link", ""),
+            }
+            prices = []
+            c_price = c.get("price_vnd_num")
+            for s in available:
+                out[f"Giá {s}"] = ""
+                if s != base_source:
+                    out[f"Match {s}"] = ""
+                    out[f"Score {s}"] = ""
+                    out[f"Chênh {s} vs {base_source} (%)"] = ""
+            out[f"Giá {src}"] = int(c_price) if isinstance(c_price, (int, float)) else ""
+            out[f"Match {src}"] = c.get("hotel_name", "")
+            out[f"Score {src}"] = ""
+            out[f"Chênh {src} vs {base_source} (%)"] = ""
+            if isinstance(c_price, (int, float)) and c_price > 0:
+                prices.append((src, float(c_price)))
+            if prices:
+                cheapest = min(prices, key=lambda x: x[1])
+                out["Kênh rẻ nhất"] = cheapest[0]
+                out["Giá rẻ nhất"] = int(cheapest[1])
+            else:
+                out["Kênh rẻ nhất"] = ""
+                out["Giá rẻ nhất"] = ""
+            out["Ghi chú"] = f"Chỉ có trên {src} (chưa cross-match với {base_source}; có thể do tên khác hoặc dưới ngưỡng {MIN_CROSS_CHANNEL_MATCH_SCORE:.0%})"
+            result.append(out)
 
     return result
 
