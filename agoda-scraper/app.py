@@ -9,7 +9,7 @@ from scraper import build_agoda_url, run_scrape
 from scraper_tripcom import build_tripcom_url, resolve_trip_city, run_scrape_tripcom
 from scraper_mytour import build_mytour_url, resolve_mytour_city, run_scrape_mytour
 from scraper_travelcomvn import build_travel_url, resolve_travel_city, run_scrape_travel
-from scraper_ivivu import run_scrape_ivivu
+from scraper_ivivu import run_scrape_ivivu, resolve_ivivu_region_url
 
 st.set_page_config(
     page_title="OTA Hotel Scraper",
@@ -603,12 +603,79 @@ elif ota_name == "Travel.com.vn":
 
 # ── IVIVU ────────────────────────────────────────────────────────────────────
 elif ota_name == "iVIVU":
-    tab_i1, tab_i2 = st.tabs(["🔗  Dán URL trực tiếp", "ℹ️  Gợi ý"])
+    tab_i1, tab_i2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
 
     with tab_i1:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         st.markdown("""<div class="info-badge info-badge-ivivu">
-          💡 Truy cập <b>ivivu.com</b>, mở trang khách sạn theo điểm đến (vd: /khach-san-nha-trang), rồi dán URL vào đây.
+          🌐 Hỗ trợ tìm kiếm theo điểm đến + ngày + số khách, tương tự các tab OTA khác.
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<div class='section-label'>📍 Điểm đến</div>", unsafe_allow_html=True)
+        iv_dest_form = st.text_input(
+            "Điểm đến", placeholder="VD: Nha Trang, Đà Lạt...",
+            key="ivivu_dest_form", label_visibility="collapsed"
+        )
+
+        iv_suggest_url = ""
+        if iv_dest_form.strip():
+            iv_suggest_url = resolve_ivivu_region_url(iv_dest_form.strip()) or ""
+            if iv_suggest_url:
+                st.caption(f"✅ URL iVIVU: {iv_suggest_url}")
+            else:
+                st.warning("⚠️ Không tìm thấy điểm đến trên iVIVU. Hãy thử tên khác hoặc dùng tab dán URL.")
+
+        col_i1, col_i2 = st.columns(2, gap="medium")
+        with col_i1:
+            st.markdown("<div class='section-label'>📅 Check-in</div>", unsafe_allow_html=True)
+            iv_checkin = st.date_input(
+                "Check-in", value=today + timedelta(days=7),
+                min_value=today, key="ivivu_checkin", label_visibility="collapsed"
+            )
+        with col_i2:
+            st.markdown("<div class='section-label'>📅 Check-out</div>", unsafe_allow_html=True)
+            iv_checkout = st.date_input(
+                "Check-out", value=today + timedelta(days=8),
+                min_value=today + timedelta(days=1), key="ivivu_checkout", label_visibility="collapsed"
+            )
+
+        col_i3, col_i4, col_i5 = st.columns(3, gap="medium")
+        with col_i3:
+            st.markdown("<div class='section-label'>🛏️ Số phòng</div>", unsafe_allow_html=True)
+            iv_rooms = st.number_input("Phòng", 1, 10, 1, key="ivivu_rooms", label_visibility="collapsed")
+        with col_i4:
+            st.markdown("<div class='section-label'>👤 Người lớn</div>", unsafe_allow_html=True)
+            iv_adults = st.number_input("Người lớn", 1, 20, 2, key="ivivu_adults", label_visibility="collapsed")
+        with col_i5:
+            st.markdown("<div class='section-label'>👶 Trẻ em</div>", unsafe_allow_html=True)
+            iv_children = st.number_input("Trẻ em", 0, 10, 0, key="ivivu_children", label_visibility="collapsed")
+
+        if iv_checkin >= iv_checkout:
+            st.error("⚠️ Check-out phải sau Check-in!")
+            iv_form_disabled = True
+        else:
+            iv_form_disabled = False
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button(
+            "🚀  Bắt đầu thu thập",
+            disabled=iv_form_disabled or not iv_dest_form.strip() or not iv_suggest_url or st.session_state.is_scraping,
+            key="ivivu_form_btn", use_container_width=True, type="primary"
+        ):
+            st.session_state.update({
+                "active_url": iv_suggest_url,
+                "active_destination": iv_dest_form.strip(),
+                "_iv_checkin": iv_checkin.strftime("%Y-%m-%d"),
+                "_iv_checkout": iv_checkout.strftime("%Y-%m-%d"),
+                "_iv_rooms": int(iv_rooms),
+                "_iv_adults": int(iv_adults),
+                "_iv_children": int(iv_children),
+                "trigger_scrape": True,
+            })
+
+    with tab_i2:
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div class="info-badge info-badge-ivivu">
+          💡 Dùng khi bạn muốn dán trực tiếp URL đã lọc sẵn trên iVIVU.
         </div>""", unsafe_allow_html=True)
         st.markdown("<div class='section-label'>🔗 URL iVIVU</div>", unsafe_allow_html=True)
         iv_url = st.text_area(
@@ -620,6 +687,24 @@ elif ota_name == "iVIVU":
             "Điểm đến", placeholder="VD: Nha Trang, Đà Lạt...",
             key="ivivu_dest", label_visibility="collapsed"
         )
+        col_d1, col_d2 = st.columns(2, gap="medium")
+        with col_d1:
+            iv_checkin_d = st.date_input(
+                "Check-in", value=today + timedelta(days=7),
+                min_value=today, key="ivivu_checkin_d", label_visibility="collapsed"
+            )
+        with col_d2:
+            iv_checkout_d = st.date_input(
+                "Check-out", value=today + timedelta(days=8),
+                min_value=today + timedelta(days=1), key="ivivu_checkout_d", label_visibility="collapsed"
+            )
+        col_d3, col_d4, col_d5 = st.columns(3, gap="medium")
+        with col_d3:
+            iv_rooms_d = st.number_input("Phòng", 1, 10, 1, key="ivivu_rooms_d", label_visibility="collapsed")
+        with col_d4:
+            iv_adults_d = st.number_input("Người lớn", 1, 20, 2, key="ivivu_adults_d", label_visibility="collapsed")
+        with col_d5:
+            iv_children_d = st.number_input("Trẻ em", 0, 10, 0, key="ivivu_children_d", label_visibility="collapsed")
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
         if st.button(
             "🚀  Bắt đầu thu thập",
@@ -629,12 +714,13 @@ elif ota_name == "iVIVU":
             st.session_state.update({
                 "active_url": iv_url.strip(),
                 "active_destination": iv_dest.strip(),
+                "_iv_checkin": iv_checkin_d.strftime("%Y-%m-%d"),
+                "_iv_checkout": iv_checkout_d.strftime("%Y-%m-%d"),
+                "_iv_rooms": int(iv_rooms_d),
+                "_iv_adults": int(iv_adults_d),
+                "_iv_children": int(iv_children_d),
                 "trigger_scrape": True,
             })
-
-    with tab_i2:
-        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-        st.info("iVIVU hiện hỗ trợ tốt nhất với URL dạng vùng, ví dụ: https://www.ivivu.com/khach-san-nha-trang")
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -660,7 +746,16 @@ if st.session_state.get("trigger_scrape"):
             elif ota_name == "Travel.com.vn":
                 results = run_scrape_travel(url=active_url, destination=active_destination, status_callback=update_status)
             elif ota_name == "iVIVU":
-                results = run_scrape_ivivu(url=active_url, destination=active_destination, status_callback=update_status)
+                results = run_scrape_ivivu(
+                    url=active_url,
+                    destination=active_destination,
+                    check_in=st.session_state.get("_iv_checkin", ""),
+                    check_out=st.session_state.get("_iv_checkout", ""),
+                    rooms=st.session_state.get("_iv_rooms", 1),
+                    adults=st.session_state.get("_iv_adults", 2),
+                    children=st.session_state.get("_iv_children", 0),
+                    status_callback=update_status,
+                )
             else:  # Mytour.vn
                 ci_str = st.session_state.get("check_in_str", "")
                 co_str = st.session_state.get("check_out_str", "")

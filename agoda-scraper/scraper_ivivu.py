@@ -12,12 +12,15 @@ import json
 import math
 import re
 import sys
+from datetime import date
+from urllib.parse import quote
 
 import requests as _requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from playwright_bootstrap import ensure_playwright_chromium
 
+IVIVU_SEARCH_API = "https://apiportal.ivivu.com/web_prot/gate/search/searchhotel?keyword={kw}"
 
 def _ensure_windows_proactor_policy() -> None:
     if sys.platform.startswith("win") and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
@@ -70,6 +73,37 @@ def _full_url(path_or_url: str) -> str:
     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
         return path_or_url
     return f"https://www.ivivu.com{path_or_url}"
+
+
+def resolve_ivivu_region_url(destination: str) -> str | None:
+    """
+    Resolve destination text to iVIVU region URL using iVIVU suggest API.
+    Returns absolute URL or None when not found.
+    """
+    try:
+        url = IVIVU_SEARCH_API.format(kw=quote(destination.strip()))
+        resp = _requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list) or not data:
+            return None
+        # Prefer exact region-level result; fallback to first item.
+        picked = None
+        key = destination.strip().lower()
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            rname = str(item.get("regionName") or "").strip().lower()
+            if item.get("type") == 2 and (rname == key or key in rname):
+                picked = item
+                break
+        if picked is None:
+            picked = data[0] if isinstance(data[0], dict) else None
+        if not picked:
+            return None
+        return _full_url(str(picked.get("regionUrl") or ""))
+    except Exception:
+        return None
 
 
 def _parse_hotel(item: dict, destination: str) -> dict:
@@ -133,7 +167,16 @@ async def _capture_search_context(url: str, status_callback):
     return captured if "body" in captured else None
 
 
-async def _scrape_async(url: str, destination: str, status_callback) -> list[dict]:
+async def _scrape_async(
+    url: str,
+    destination: str,
+    status_callback,
+    check_in: str = "",
+    check_out: str = "",
+    rooms: int = 1,
+    adults: int = 2,
+    children: int = 0,
+) -> list[dict]:
     ctx = await _capture_search_context(url, status_callback)
     if not ctx:
         raise RuntimeError("Không lấy được dữ liệu API iVIVU từ URL này.")
@@ -144,13 +187,20 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
         base_body = {}
     page_size = int(base_body.get("pageSize") or 15)
 
-    first_data = (ctx.get("first_json") or {}).get("data") or {}
-    first_items = first_data.get("list") or []
-    total_hotels = int(first_data.get("total") or 0)
-    total_pages = max(1, math.ceil(total_hotels / max(page_size, 1))) if total_hotels else 1
-    total_pages = min(total_pages, 200)
-
-    status_callback(f"📊 iVIVU: tổng ~{total_hotels or '?'} khách sạn, {total_pages} trang")
+    # Override search params from UI if provided.
+    if check_in:
+        base_body["checkInDate"] = check_in
+    if check_out:
+        base_body["checkOutDate"] = check_out
+    rp = base_body.get("roomPicker")
+    if not isinstance(rp, dict):
+        rp = {}
+        base_body["roomPicker"] = rp
+    rp["adultNumber"] = int(max(1, adults))
+    rp["childNumber"] = int(max(0, children))
+    rp["roomNumber"] = int(max(1, rooms))
+    if "childAges" not in rp or not isinstance(rp.get("childAges"), list):
+        rp["childAges"] = []
 
     sess = _requests.Session()
     headers = dict(ctx.get("headers") or {})
@@ -175,8 +225,19 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
             added += 1
         return added
 
-    add_items(first_items)
-    status_callback(f"📄 Trang 1/{total_pages}: +{len(first_items)} raw (tổng: {len(results)})")
+    # Always fetch page 1 with the effective body to avoid stale captured dates.
+    first_resp = sess.post(ctx["url"], json={**base_body, "pageIndex": 1}, timeout=20)
+    first_resp.raise_for_status()
+    first_data = (first_resp.json().get("data") or {})
+    first_items = first_data.get("list") or []
+    total_hotels = int(first_data.get("total") or 0)
+    total_pages = max(1, math.ceil(total_hotels / max(page_size, 1))) if total_hotels else 1
+    total_pages = min(total_pages, 200)
+
+    status_callback(f"📊 iVIVU: tổng ~{total_hotels or '?'} khách sạn, {total_pages} trang")
+
+    add_items(first_items if isinstance(first_items, list) else [])
+    status_callback(f"📄 Trang 1/{total_pages}: +{len(first_items) if isinstance(first_items, list) else 0} raw (tổng: {len(results)})")
 
     consecutive_empty = 0
     for pg in range(2, total_pages + 1):
@@ -212,9 +273,24 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
     return results
 
 
-def run_scrape_ivivu(url: str, destination: str, status_callback=None) -> list[dict]:
+def run_scrape_ivivu(
+    url: str,
+    destination: str,
+    status_callback=None,
+    check_in: str = "",
+    check_out: str = "",
+    rooms: int = 1,
+    adults: int = 2,
+    children: int = 0,
+) -> list[dict]:
     if status_callback is None:
         status_callback = print
     _ensure_windows_proactor_policy()
     ensure_playwright_chromium(status_callback)
-    return asyncio.run(_scrape_async(url, destination, status_callback))
+    return asyncio.run(
+        _scrape_async(
+            url, destination, status_callback,
+            check_in=check_in, check_out=check_out,
+            rooms=rooms, adults=adults, children=children,
+        )
+    )
