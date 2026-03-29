@@ -87,31 +87,36 @@ def _ipv4_hostaddr(hostname: str) -> str | None:
     return None
 
 
-def _pooler_rewrite_configured() -> bool:
-    secrets = _safe_streamlit_secrets()
-    r = _secret_str(os.getenv("SUPABASE_POOLER_REGION") or secrets.get("SUPABASE_POOLER_REGION", ""))
-    h = _secret_str(os.getenv("SUPABASE_POOLER_HOST") or secrets.get("SUPABASE_POOLER_HOST", ""))
-    return bool(r or h)
+# Transaction pooler host = aws-0-<region>.pooler.supabase.com :6543, user postgres.<project_ref>
+_COMMON_POOLER_REGIONS: tuple[str, ...] = (
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-south-1",
+    "us-east-1",
+    "us-west-1",
+    "eu-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "ca-central-1",
+    "sa-east-1",
+)
 
 
-def _supabase_direct_to_pooler_dsn(dsn: str) -> str:
-    """
-    Streamlit Cloud thường không kết nối được db.*.supabase.co:5432 (IPv6).
-    Nếu Secrets có SUPABASE_POOLER_REGION hoặc SUPABASE_POOLER_HOST, tự đổi URI
-    sang Transaction pooler (port 6543, user postgres.<project_ref>).
-    """
-    secrets = _safe_streamlit_secrets()
-    region = _secret_str(os.getenv("SUPABASE_POOLER_REGION") or secrets.get("SUPABASE_POOLER_REGION", ""))
-    pooler_host = _secret_str(os.getenv("SUPABASE_POOLER_HOST") or secrets.get("SUPABASE_POOLER_HOST", ""))
+def _build_pooler_dsn_from_direct(
+    dsn: str, region: str | None, pooler_host: str | None
+) -> str | None:
+    """Từ URI db.<ref>.supabase.co:5432 → pooler 6543. Cần region hoặc pooler_host."""
     if not region and not pooler_host:
-        return dsn
+        return None
     u = urlparse(_normalize_database_url(dsn))
     hn = (u.hostname or "").lower()
     m = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", hn)
     if not m:
-        return dsn
+        return None
     if (u.port or 5432) != 5432:
-        return dsn
+        return None
     ref = m.group(1)
     host_out = pooler_host or f"aws-0-{region}.pooler.supabase.com"
     user_plain = unquote(u.username or "postgres")
@@ -125,6 +130,45 @@ def _supabase_direct_to_pooler_dsn(dsn: str) -> str:
     if "sslmode=" not in (q or ""):
         q = "sslmode=require" + (f"&{q}" if q else "")
     return urlunparse(("postgresql", netloc, path, "", q, ""))
+
+
+def _direct_supabase_pooler_candidates(dsn: str) -> list[str]:
+    """
+    Các URI pooler để thử (ưu tiên region/host trong Secrets, sau đó thử nhiều region).
+    Dùng khi Streamlit Cloud không kết nối được db.*:5432 (IPv6).
+    """
+    secrets = _safe_streamlit_secrets()
+    user_region = _secret_str(os.getenv("SUPABASE_POOLER_REGION") or secrets.get("SUPABASE_POOLER_REGION", ""))
+    user_host = _secret_str(os.getenv("SUPABASE_POOLER_HOST") or secrets.get("SUPABASE_POOLER_HOST", ""))
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def push(region: str | None, host: str | None) -> None:
+        b = _build_pooler_dsn_from_direct(dsn, region, host)
+        if b and b not in seen:
+            seen.add(b)
+            out.append(b)
+
+    push(user_region or None, user_host or None)
+    if user_host:
+        return out
+    for r in _COMMON_POOLER_REGIONS:
+        if r == user_region:
+            continue
+        push(r, None)
+    return out
+
+
+def _supabase_direct_to_pooler_dsn(dsn: str) -> str:
+    """
+    Giữ tương thích: nếu có SUPABASE_POOLER_* trong Secrets thì đổi 1 lần.
+    (Luồng chính dùng _direct_supabase_pooler_candidates + thử lần lượt.)
+    """
+    secrets = _safe_streamlit_secrets()
+    region = _secret_str(os.getenv("SUPABASE_POOLER_REGION") or secrets.get("SUPABASE_POOLER_REGION", ""))
+    pooler_host = _secret_str(os.getenv("SUPABASE_POOLER_HOST") or secrets.get("SUPABASE_POOLER_HOST", ""))
+    built = _build_pooler_dsn_from_direct(dsn, region or None, pooler_host or None)
+    return built if built else dsn
 
 
 def _supabase_direct_db_host(hostname: str | None) -> bool:
@@ -184,10 +228,30 @@ def get_conn():
         timeout = 15
     if cfg["database_url"]:
         dsn = _normalize_database_url(cfg["database_url"])
+        u = urlparse(dsn)
+        per_try_timeout = min(timeout, 12)
+        if _supabase_direct_db_host(u.hostname or "") and (u.port or 5432) == 5432:
+            for cand in _direct_supabase_pooler_candidates(dsn):
+                try:
+                    return psycopg2.connect(
+                        cand, cursor_factory=RealDictCursor, connect_timeout=per_try_timeout
+                    )
+                except psycopg2.OperationalError:
+                    continue
+            kw_url = _connect_kw_from_database_url_ipv4(dsn, timeout)
+            if kw_url:
+                try:
+                    return psycopg2.connect(**kw_url)
+                except psycopg2.OperationalError:
+                    pass
+            return psycopg2.connect(dsn, cursor_factory=RealDictCursor, connect_timeout=timeout)
         dsn = _supabase_direct_to_pooler_dsn(dsn)
         kw_url = _connect_kw_from_database_url_ipv4(dsn, timeout)
         if kw_url:
-            return psycopg2.connect(**kw_url)
+            try:
+                return psycopg2.connect(**kw_url)
+            except psycopg2.OperationalError:
+                pass
         return psycopg2.connect(dsn, cursor_factory=RealDictCursor, connect_timeout=timeout)
     kw: dict[str, Any] = {
         "host": cfg["host"],
@@ -199,16 +263,21 @@ def get_conn():
         "connect_timeout": timeout,
         "cursor_factory": RealDictCursor,
     }
-    if _supabase_direct_db_host(cfg["host"]) and _pooler_rewrite_configured():
+    if _supabase_direct_db_host(cfg["host"]) and int(cfg["port"]) == 5432:
         uq = quote(cfg["user"], safe="")
         pq = quote(cfg["password"], safe="")
         fake = (
             f"postgresql://{uq}:{pq}@{cfg['host']}:{int(cfg['port'])}/{cfg['dbname']}"
             f"?sslmode={quote(cfg['sslmode'], safe='')}"
         )
-        pool_dsn = _supabase_direct_to_pooler_dsn(_normalize_database_url(fake))
-        if pool_dsn != fake:
-            return psycopg2.connect(pool_dsn, cursor_factory=RealDictCursor, connect_timeout=timeout)
+        per_try = min(timeout, 12)
+        for cand in _direct_supabase_pooler_candidates(_normalize_database_url(fake)):
+            try:
+                return psycopg2.connect(
+                    cand, cursor_factory=RealDictCursor, connect_timeout=per_try
+                )
+            except psycopg2.OperationalError:
+                continue
     if _supabase_direct_db_host(cfg["host"]):
         v4 = _ipv4_hostaddr(cfg["host"])
         if v4:
@@ -274,9 +343,8 @@ def init_db() -> tuple[bool, str]:
             except Exception:
                 pass
         hint = (
-            " Streamlit Cloud: dán URI **Transaction pooler** (port 6543) từ Supabase → Database → Connect, "
-            "hoặc giữ DATABASE_URL dạng db.*:5432 và thêm Secrets: SUPABASE_POOLER_REGION = \"ap-southeast-1\" "
-            "(đúng region trong Project Settings → General / Database)."
+            " Nếu vẫn dùng db.*.supabase.co:5432: app đã thử pooler theo nhiều region; nếu hết cả — "
+            "vào Supabase → Database → Connect → **Transaction pooler** và dán đúng URI (host pooler, port 6543, user postgres.<ref>)."
         )
         err_head = str(e).strip().split("\n")[0][:220]
         return False, f"Không kết nối/khởi tạo DB: {type(e).__name__}: {err_head}{hint}"
