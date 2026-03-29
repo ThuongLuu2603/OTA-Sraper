@@ -1,11 +1,12 @@
 import json
 import os
+import re
 import socket
 import unicodedata
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlunparse, quote
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -74,12 +75,56 @@ def _ipv4_hostaddr(hostname: str) -> str | None:
     if not hostname:
         return None
     try:
+        return socket.gethostbyname(hostname)
+    except OSError:
+        pass
+    try:
         infos = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
         if infos:
             return infos[0][4][0]
     except OSError:
         pass
     return None
+
+
+def _pooler_rewrite_configured() -> bool:
+    secrets = _safe_streamlit_secrets()
+    r = _secret_str(os.getenv("SUPABASE_POOLER_REGION") or secrets.get("SUPABASE_POOLER_REGION", ""))
+    h = _secret_str(os.getenv("SUPABASE_POOLER_HOST") or secrets.get("SUPABASE_POOLER_HOST", ""))
+    return bool(r or h)
+
+
+def _supabase_direct_to_pooler_dsn(dsn: str) -> str:
+    """
+    Streamlit Cloud thường không kết nối được db.*.supabase.co:5432 (IPv6).
+    Nếu Secrets có SUPABASE_POOLER_REGION hoặc SUPABASE_POOLER_HOST, tự đổi URI
+    sang Transaction pooler (port 6543, user postgres.<project_ref>).
+    """
+    secrets = _safe_streamlit_secrets()
+    region = _secret_str(os.getenv("SUPABASE_POOLER_REGION") or secrets.get("SUPABASE_POOLER_REGION", ""))
+    pooler_host = _secret_str(os.getenv("SUPABASE_POOLER_HOST") or secrets.get("SUPABASE_POOLER_HOST", ""))
+    if not region and not pooler_host:
+        return dsn
+    u = urlparse(_normalize_database_url(dsn))
+    hn = (u.hostname or "").lower()
+    m = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", hn)
+    if not m:
+        return dsn
+    if (u.port or 5432) != 5432:
+        return dsn
+    ref = m.group(1)
+    host_out = pooler_host or f"aws-0-{region}.pooler.supabase.com"
+    user_plain = unquote(u.username or "postgres")
+    pooler_user = f"postgres.{ref}" if user_plain == "postgres" else user_plain
+    pwd_plain = unquote(u.password or "")
+    netloc = f"{quote(pooler_user, safe='')}:{quote(pwd_plain, safe='')}@{host_out}:6543"
+    path = u.path if u.path and u.path != "" else "/postgres"
+    if not path.startswith("/"):
+        path = "/" + path
+    q = u.query
+    if "sslmode=" not in (q or ""):
+        q = "sslmode=require" + (f"&{q}" if q else "")
+    return urlunparse(("postgresql", netloc, path, "", q, ""))
 
 
 def _supabase_direct_db_host(hostname: str | None) -> bool:
@@ -139,6 +184,7 @@ def get_conn():
         timeout = 15
     if cfg["database_url"]:
         dsn = _normalize_database_url(cfg["database_url"])
+        dsn = _supabase_direct_to_pooler_dsn(dsn)
         kw_url = _connect_kw_from_database_url_ipv4(dsn, timeout)
         if kw_url:
             return psycopg2.connect(**kw_url)
@@ -153,6 +199,16 @@ def get_conn():
         "connect_timeout": timeout,
         "cursor_factory": RealDictCursor,
     }
+    if _supabase_direct_db_host(cfg["host"]) and _pooler_rewrite_configured():
+        uq = quote(cfg["user"], safe="")
+        pq = quote(cfg["password"], safe="")
+        fake = (
+            f"postgresql://{uq}:{pq}@{cfg['host']}:{int(cfg['port'])}/{cfg['dbname']}"
+            f"?sslmode={quote(cfg['sslmode'], safe='')}"
+        )
+        pool_dsn = _supabase_direct_to_pooler_dsn(_normalize_database_url(fake))
+        if pool_dsn != fake:
+            return psycopg2.connect(pool_dsn, cursor_factory=RealDictCursor, connect_timeout=timeout)
     if _supabase_direct_db_host(cfg["host"]):
         v4 = _ipv4_hostaddr(cfg["host"])
         if v4:
@@ -218,8 +274,9 @@ def init_db() -> tuple[bool, str]:
             except Exception:
                 pass
         hint = (
-            " (Streamlit Cloud: thử DATABASE_URL pooler port 6543 từ Supabase → Connect → "
-            "Transaction pooler, hoặc bật IPv4 add-on nếu dùng host db.*.supabase.co:5432)"
+            " Streamlit Cloud: dán URI **Transaction pooler** (port 6543) từ Supabase → Database → Connect, "
+            "hoặc giữ DATABASE_URL dạng db.*:5432 và thêm Secrets: SUPABASE_POOLER_REGION = \"ap-southeast-1\" "
+            "(đúng region trong Project Settings → General / Database)."
         )
         err_head = str(e).strip().split("\n")[0][:220]
         return False, f"Không kết nối/khởi tạo DB: {type(e).__name__}: {err_head}{hint}"
