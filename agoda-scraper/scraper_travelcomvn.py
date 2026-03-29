@@ -22,6 +22,7 @@ from urllib.parse import urlparse, parse_qs, quote
 
 import requests as _requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_bootstrap import ensure_playwright_chromium
 
 # ---------------------------------------------------------------------------
 # Known cities: (slug, city_id, display_name)
@@ -362,6 +363,7 @@ def run_scrape_travel(
     if status_callback is None:
         status_callback = lambda _: None
     _ensure_windows_proactor_policy()
+    ensure_playwright_chromium(status_callback)
     return asyncio.run(_scrape_async(url, destination, status_callback))
 
 

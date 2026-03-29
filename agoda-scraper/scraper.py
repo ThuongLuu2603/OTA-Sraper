@@ -8,6 +8,7 @@ import sys
 from datetime import datetime
 from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_bootstrap import ensure_playwright_chromium
 
 
 # ---------------------------------------------------------------------------
@@ -469,4 +470,5 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
 def run_scrape(url: str, destination: str, status_callback=None) -> list:
     """Synchronous wrapper."""
     _ensure_windows_proactor_policy()
+    ensure_playwright_chromium(status_callback)
     return asyncio.run(scrape_agoda(url, destination, status_callback))

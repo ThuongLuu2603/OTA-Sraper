@@ -16,6 +16,7 @@ import re
 import shutil
 import sys
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_bootstrap import ensure_playwright_chromium
 
 # ---------------------------------------------------------------------------
 # Province ID mapping (Mytour/Tripi internal IDs, verified by API probe)
@@ -629,6 +630,7 @@ def run_scrape_mytour(url: str, destination: str, check_in: str, check_out: str,
     if status_callback is None:
         status_callback = print
     _ensure_windows_proactor_policy()
+    ensure_playwright_chromium(status_callback)
 
     if province_id is not None:
         return asyncio.run(_scrape_async(

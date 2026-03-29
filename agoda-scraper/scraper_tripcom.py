@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_bootstrap import ensure_playwright_chromium
 
 # ---------------------------------------------------------------------------
 # Known Vietnamese city IDs on Trip.com (cityId, countryId=111)
@@ -1066,4 +1067,5 @@ def run_scrape_tripcom(url: str, destination: str, status_callback=None) -> list
     if status_callback is None:
         status_callback = print
     _ensure_windows_proactor_policy()
+    ensure_playwright_chromium(status_callback)
     return asyncio.run(_scrape_async(url, destination, status_callback))
