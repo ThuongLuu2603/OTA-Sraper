@@ -647,6 +647,64 @@ def list_tour_cases(limit: int = 200, source: str | None = None) -> list[dict]:
         conn.close()
 
 
+def delete_tour_case(case_key: str) -> tuple[bool, str]:
+    """Xóa case tour và toàn bộ snapshot (CASCADE)."""
+    ok, msg = init_db()
+    if not ok:
+        return False, f"DB chưa sẵn sàng: {msg}"
+    ck = (case_key or "").strip()
+    if not ck:
+        return False, "Thiếu case_key"
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tour_case WHERE case_key = %s", (ck,))
+            n = cur.rowcount
+        conn.commit()
+        if n == 0:
+            return False, "Không tìm thấy case tour trong DB."
+        return True, "Đã xóa case tour và mọi dữ liệu liên quan."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Lỗi xóa: {type(e).__name__}: {str(e)[:220]}"
+    finally:
+        conn.close()
+
+
+def delete_tour_case_source(case_key: str, source: str) -> tuple[bool, str]:
+    """Xóa snapshot của một nguồn; nếu case không còn dòng nào thì xóa luôn tour_case."""
+    ok, msg = init_db()
+    if not ok:
+        return False, f"DB chưa sẵn sàng: {msg}"
+    ck = (case_key or "").strip()
+    src = (source or "").strip()
+    if not ck or not src:
+        return False, "Thiếu case_key hoặc source"
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM tour_snapshot WHERE case_key = %s AND source = %s",
+                (ck, src),
+            )
+            removed = cur.rowcount
+            cur.execute(
+                "SELECT 1 FROM tour_snapshot WHERE case_key = %s LIMIT 1",
+                (ck,),
+            )
+            if not cur.fetchone():
+                cur.execute("DELETE FROM tour_case WHERE case_key = %s", (ck,))
+        conn.commit()
+        if removed == 0:
+            return False, f"Không có dữ liệu {src} cho case này."
+        return True, f"Đã xóa {removed} dòng tour của {src}."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Lỗi xóa: {type(e).__name__}: {str(e)[:220]}"
+    finally:
+        conn.close()
+
+
 def get_tour_case_rows(case_key: str, source: str) -> list[dict]:
     ok, _ = db_ready()
     if not ok:
@@ -736,6 +794,64 @@ def list_hotel_cases(limit: int = 200, source: str | None = None) -> list[dict]:
                     (int(limit),),
                 )
             return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def delete_hotel_case(case_key: str) -> tuple[bool, str]:
+    """Xóa case khách sạn và toàn bộ snapshot mọi kênh (CASCADE)."""
+    ok, msg = init_db()
+    if not ok:
+        return False, f"DB chưa sẵn sàng: {msg}"
+    ck = (case_key or "").strip()
+    if not ck:
+        return False, "Thiếu case_key"
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM hotel_case WHERE case_key = %s", (ck,))
+            n = cur.rowcount
+        conn.commit()
+        if n == 0:
+            return False, "Không tìm thấy case trong DB."
+        return True, "Đã xóa case và mọi dữ liệu khách sạn đã lưu (tất cả OTA)."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Lỗi xóa: {type(e).__name__}: {str(e)[:220]}"
+    finally:
+        conn.close()
+
+
+def delete_hotel_case_source(case_key: str, source: str) -> tuple[bool, str]:
+    """Xóa snapshot của một OTA; nếu case không còn dòng nào thì xóa luôn hotel_case."""
+    ok, msg = init_db()
+    if not ok:
+        return False, f"DB chưa sẵn sàng: {msg}"
+    ck = (case_key or "").strip()
+    src = (source or "").strip()
+    if not ck or not src:
+        return False, "Thiếu case_key hoặc source"
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM hotel_snapshot WHERE case_key = %s AND source = %s",
+                (ck, src),
+            )
+            removed = cur.rowcount
+            cur.execute(
+                "SELECT 1 FROM hotel_snapshot WHERE case_key = %s LIMIT 1",
+                (ck,),
+            )
+            if not cur.fetchone():
+                cur.execute("DELETE FROM hotel_case WHERE case_key = %s", (ck,))
+        conn.commit()
+        if removed == 0:
+            return False, f"Không có dữ liệu {src} cho case này."
+        return True, f"Đã xóa {removed} khách sạn đã lưu của {src}."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Lỗi xóa: {type(e).__name__}: {str(e)[:220]}"
     finally:
         conn.close()
 

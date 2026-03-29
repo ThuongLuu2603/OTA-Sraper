@@ -23,6 +23,8 @@ from market_db import (
     build_cross_channel_compare,
     get_case_rows,
     get_tour_case_rows,
+    delete_hotel_case_source,
+    delete_tour_case_source,
 )
 
 st.set_page_config(
@@ -31,6 +33,84 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+@st.dialog("Xóa dữ liệu kênh này?")
+def _dlg_confirm_delete_hotel_case():
+    d = st.session_state.get("_hotel_case_delete_draft")
+    if not d:
+        return
+    ck = d.get("case_key") or ""
+    lb = d.get("label") or ""
+    ota = d.get("ota") or "ota"
+    st.write(
+        f"Xóa **chỉ** dữ liệu khách sạn đã lưu của **{ota}** cho case này? "
+        "Các OTA khác cùng case key không bị động."
+    )
+    st.caption("Case key dùng chung cho cùng điểm đến / ngày / số khách; mỗi kênh lưu snapshot riêng.")
+    st.caption(lb)
+    if ck:
+        st.caption(f"`{ck}`")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Hủy", key=f"dlg_hotel_cancel_{ota}", use_container_width=True):
+            st.session_state.pop("_hotel_case_delete_draft", None)
+            st.rerun()
+    with c2:
+        if st.button("Xóa", key=f"dlg_hotel_ok_{ota}", type="primary", use_container_width=True):
+            if not ck.strip():
+                st.session_state.pop("_hotel_case_delete_draft", None)
+                st.session_state["_hotel_db_feedback"] = ("err", "Thiếu case key.")
+                st.rerun()
+                return
+            ok_del, msg_del = delete_hotel_case_source(ck, ota)
+            st.session_state.pop("_hotel_case_delete_draft", None)
+            if ok_del:
+                if st.session_state.get("active_case_key") == ck and st.session_state.get("active_source") == ota:
+                    st.session_state.scrape_results = None
+                st.session_state.pop("global_compare_df", None)
+                st.session_state["_hotel_db_feedback"] = ("ok", msg_del)
+            else:
+                st.session_state["_hotel_db_feedback"] = ("err", msg_del)
+            st.rerun()
+
+
+@st.dialog("Xóa dữ liệu nguồn này?")
+def _dlg_confirm_delete_tour_case():
+    d = st.session_state.get("_tour_case_delete_draft")
+    if not d:
+        return
+    ck = d.get("case_key") or ""
+    lb = d.get("label") or ""
+    ota = d.get("ota") or "ota"
+    st.write(
+        f"Xóa **chỉ** dữ liệu tour đã lưu của **{ota}** cho case này? "
+        "Nguồn khác cùng case key không bị động."
+    )
+    st.caption(lb)
+    if ck:
+        st.caption(f"`{ck}`")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Hủy", key=f"dlg_tour_cancel_{ota}", use_container_width=True):
+            st.session_state.pop("_tour_case_delete_draft", None)
+            st.rerun()
+    with c2:
+        if st.button("Xóa", key=f"dlg_tour_ok_{ota}", type="primary", use_container_width=True):
+            if not ck.strip():
+                st.session_state.pop("_tour_case_delete_draft", None)
+                st.session_state["_tour_db_feedback"] = ("err", "Thiếu case key.")
+                st.rerun()
+                return
+            ok_del, msg_del = delete_tour_case_source(ck, ota)
+            st.session_state.pop("_tour_case_delete_draft", None)
+            if ok_del:
+                if st.session_state.get("active_case_key") == ck and st.session_state.get("active_source") == ota:
+                    st.session_state.scrape_results = None
+                st.session_state["_tour_db_feedback"] = ("ok", msg_del)
+            else:
+                st.session_state["_tour_db_feedback"] = ("err", msg_del)
+            st.rerun()
 
 
 def normalize_agoda_direct_url(raw_url: str) -> str:
@@ -1382,6 +1462,13 @@ elif segment_name == "Hotel":
             if not source_cases:
                 st.caption(f"Chưa có case nào của kênh {ota_name} trong DB.")
             else:
+                fb = st.session_state.pop("_hotel_db_feedback", None)
+                if fb:
+                    if fb[0] == "ok":
+                        st.success(fb[1])
+                    else:
+                        st.error(fb[1])
+
                 options = []
                 case_meta_map = {}
                 for c in source_cases:
@@ -1393,10 +1480,33 @@ elif segment_name == "Hotel":
                     options.append(label)
                     case_meta_map[label] = c
 
-                selected_label = st.selectbox("Case đã lưu của kênh này", options, key=f"case_picker_{ota_name}")
+                row_pick, row_trash = st.columns([1, 0.14], vertical_alignment="bottom")
+                with row_pick:
+                    selected_label = st.selectbox(
+                        "Case đã lưu của kênh này",
+                        options,
+                        key=f"case_picker_{ota_name}",
+                    )
                 selected_case = case_meta_map.get(selected_label, {})
                 selected_case_key = selected_case.get("case_key", "")
+                with row_trash:
+                    if st.button(
+                        "🗑️",
+                        key=f"case_trash_{ota_name}",
+                        help=f"Xóa dữ liệu đã lưu của {ota_name} cho case này",
+                        use_container_width=True,
+                    ):
+                        if (selected_case_key or "").strip():
+                            st.session_state["_hotel_case_delete_draft"] = {
+                                "case_key": selected_case_key,
+                                "label": selected_label,
+                                "ota": ota_name,
+                            }
+
                 st.caption(f"Case key: `{selected_case_key}`")
+
+                if st.session_state.get("_hotel_case_delete_draft"):
+                    _dlg_confirm_delete_hotel_case()
 
                 if st.button("📥 Nạp lại case vào bảng kết quả", key=f"load_case_{ota_name}", use_container_width=True):
                     loaded_rows = get_case_rows(selected_case_key, ota_name)
@@ -1423,6 +1533,13 @@ elif segment_name == "Tour":
             if not tour_cases:
                 st.caption(f"Chưa có case tour nào của nguồn {ota_name} trong DB.")
             else:
+                tfb = st.session_state.pop("_tour_db_feedback", None)
+                if tfb:
+                    if tfb[0] == "ok":
+                        st.success(tfb[1])
+                    else:
+                        st.error(tfb[1])
+
                 t_options = []
                 t_meta = {}
                 for c in tour_cases:
@@ -1432,10 +1549,31 @@ elif segment_name == "Tour":
                     )
                     t_options.append(t_label)
                     t_meta[t_label] = c
-                t_sel = st.selectbox("Case tour đã lưu", t_options, key=f"tour_case_picker_{ota_name}")
+
+                t_row_pick, t_row_trash = st.columns([1, 0.14], vertical_alignment="bottom")
+                with t_row_pick:
+                    t_sel = st.selectbox("Case tour đã lưu", t_options, key=f"tour_case_picker_{ota_name}")
                 t_case = t_meta.get(t_sel, {})
                 t_key = t_case.get("case_key", "")
+                with t_row_trash:
+                    if st.button(
+                        "🗑️",
+                        key=f"tour_case_trash_{ota_name}",
+                        help=f"Xóa dữ liệu tour đã lưu của {ota_name} cho case này",
+                        use_container_width=True,
+                    ):
+                        if (t_key or "").strip():
+                            st.session_state["_tour_case_delete_draft"] = {
+                                "case_key": t_key,
+                                "label": t_sel,
+                                "ota": ota_name,
+                            }
+
                 st.caption(f"Case key: `{t_key}`")
+
+                if st.session_state.get("_tour_case_delete_draft"):
+                    _dlg_confirm_delete_tour_case()
+
                 if st.button("📥 Nạp lại case tour vào bảng", key=f"load_tour_case_{ota_name}", use_container_width=True):
                     loaded = get_tour_case_rows(t_key, ota_name)
                     if loaded:
