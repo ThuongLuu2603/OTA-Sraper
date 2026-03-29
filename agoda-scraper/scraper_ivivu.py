@@ -1,0 +1,220 @@
+"""
+iVIVU hotel scraper via internal SearchHotelList API replay.
+
+Flow:
+1. Open region URL once with Playwright and capture the first SearchHotelList request.
+2. Reuse the captured request payload/headers and replay pageIndex=1..N.
+3. Parse response.data.list into the unified output schema.
+"""
+
+import asyncio
+import json
+import math
+import re
+import sys
+
+import requests as _requests
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+from playwright_bootstrap import ensure_playwright_chromium
+
+
+def _ensure_windows_proactor_policy() -> None:
+    if sys.platform.startswith("win") and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+
+def _fmt_stars(star_score) -> str:
+    """
+    iVIVU `rating` commonly appears as 50 for 5-star, 45 for 4.5-star.
+    """
+    if star_score is None:
+        return ""
+    try:
+        v = float(star_score)
+        if v <= 0:
+            return ""
+        if v > 10:
+            v = v / 10.0
+        if abs(v - round(v)) < 1e-9:
+            return f"{int(round(v))} sao"
+        return f"{v:g} sao"
+    except Exception:
+        return ""
+
+
+def _fmt_score(point) -> str:
+    if point is None:
+        return ""
+    try:
+        v = float(str(point).replace(",", "."))
+        if v <= 0:
+            return ""
+        return f"{v:g}/10"
+    except Exception:
+        return ""
+
+
+def _clean_price(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"\s+", " ", str(text)).strip()
+    if "VND" not in t.upper():
+        t = f"{t} VND"
+    return t
+
+
+def _full_url(path_or_url: str) -> str:
+    if not path_or_url:
+        return ""
+    if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+        return path_or_url
+    return f"https://www.ivivu.com{path_or_url}"
+
+
+def _parse_hotel(item: dict, destination: str) -> dict:
+    return {
+        "Tên khách sạn": item.get("hotelName", "").strip(),
+        "Link khách sạn": _full_url(item.get("hotelLink") or item.get("url") or ""),
+        "Địa chỉ": (item.get("address") or "").strip(),
+        "Hạng sao": _fmt_stars(item.get("rating")),
+        "Điểm đánh giá": _fmt_score(item.get("point")),
+        "Số đánh giá": str(int(item.get("reviewCount") or 0)) if item.get("reviewCount") else "",
+        "Giá/đêm (VND)": _clean_price(item.get("minPrice") or item.get("showPrice") or ""),
+        "Chính sách hoàn hủy": "",
+        "Nguồn": "ivivu.com",
+        "Điểm đến": destination,
+    }
+
+
+async def _capture_search_context(url: str, status_callback):
+    captured: dict = {}
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        page = await browser.new_page()
+
+        async def on_response(resp):
+            if "SearchHotelList" not in resp.url or "payload" in captured:
+                return
+            try:
+                data = await resp.json()
+            except Exception:
+                return
+            if not isinstance(data, dict) or not data.get("success"):
+                return
+            payload = data.get("data") or {}
+            items = payload.get("list") or []
+            if not isinstance(items, list):
+                return
+            req = resp.request
+            captured["url"] = resp.url
+            captured["method"] = req.method
+            captured["headers"] = dict(req.headers)
+            captured["body"] = req.post_data or "{}"
+            captured["first_json"] = data
+
+        page.on("response", on_response)
+
+        status_callback("🌐 Đang mở iVIVU để lấy ngữ cảnh truy vấn...")
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+        except PlaywrightTimeoutError:
+            await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+
+        for _ in range(20):
+            if "body" in captured:
+                break
+            await asyncio.sleep(0.5)
+
+        await browser.close()
+    return captured if "body" in captured else None
+
+
+async def _scrape_async(url: str, destination: str, status_callback) -> list[dict]:
+    ctx = await _capture_search_context(url, status_callback)
+    if not ctx:
+        raise RuntimeError("Không lấy được dữ liệu API iVIVU từ URL này.")
+
+    try:
+        base_body = json.loads(ctx["body"])
+    except Exception:
+        base_body = {}
+    page_size = int(base_body.get("pageSize") or 15)
+
+    first_data = (ctx.get("first_json") or {}).get("data") or {}
+    first_items = first_data.get("list") or []
+    total_hotels = int(first_data.get("total") or 0)
+    total_pages = max(1, math.ceil(total_hotels / max(page_size, 1))) if total_hotels else 1
+    total_pages = min(total_pages, 200)
+
+    status_callback(f"📊 iVIVU: tổng ~{total_hotels or '?'} khách sạn, {total_pages} trang")
+
+    sess = _requests.Session()
+    headers = dict(ctx.get("headers") or {})
+    for hk in list(headers.keys()):
+        if hk.lower() in {"content-length", "host", "connection", "accept-encoding"}:
+            headers.pop(hk, None)
+    sess.headers.update(headers)
+
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    def add_items(items: list[dict]) -> int:
+        added = 0
+        for it in items:
+            hid = str(it.get("hotelId") or it.get("hotelCode") or "").strip()
+            name = (it.get("hotelName") or "").strip().lower()
+            key = hid or name
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            results.append(_parse_hotel(it, destination))
+            added += 1
+        return added
+
+    add_items(first_items)
+    status_callback(f"📄 Trang 1/{total_pages}: +{len(first_items)} raw (tổng: {len(results)})")
+
+    consecutive_empty = 0
+    for pg in range(2, total_pages + 1):
+        if len(results) >= 3000:
+            status_callback("⚠️ Đạt giới hạn 3000 khách sạn, dừng.")
+            break
+
+        body = json.loads(json.dumps(base_body, ensure_ascii=False))
+        body["pageIndex"] = pg
+        try:
+            resp = sess.post(ctx["url"], json=body, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json().get("data") or {}
+            items = payload.get("list") or []
+        except Exception as e:
+            consecutive_empty += 1
+            status_callback(f"  ⚠️ Trang {pg} lỗi: {type(e).__name__}")
+            if consecutive_empty >= 3:
+                break
+            continue
+
+        added = add_items(items if isinstance(items, list) else [])
+        status_callback(f"📄 Trang {pg}/{total_pages}: +{added} mới (tổng: {len(results)})")
+
+        if added == 0:
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                status_callback("⚠️ 3 trang liên tiếp không có mới, dừng.")
+                break
+        else:
+            consecutive_empty = 0
+
+    return results
+
+
+def run_scrape_ivivu(url: str, destination: str, status_callback=None) -> list[dict]:
+    if status_callback is None:
+        status_callback = print
+    _ensure_windows_proactor_policy()
+    ensure_playwright_chromium(status_callback)
+    return asyncio.run(_scrape_async(url, destination, status_callback))

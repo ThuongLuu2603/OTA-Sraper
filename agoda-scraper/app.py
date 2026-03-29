@@ -9,6 +9,7 @@ from scraper import build_agoda_url, run_scrape
 from scraper_tripcom import build_tripcom_url, resolve_trip_city, run_scrape_tripcom
 from scraper_mytour import build_mytour_url, resolve_mytour_city, run_scrape_mytour
 from scraper_travelcomvn import build_travel_url, resolve_travel_city, run_scrape_travel
+from scraper_ivivu import run_scrape_ivivu
 
 st.set_page_config(
     page_title="OTA Hotel Scraper",
@@ -55,6 +56,7 @@ st.markdown("""
 .hero-tripcom { background: linear-gradient(135deg, #007DFF 0%, #00B4D8 60%, #0096C7 100%); }
 .hero-mytour  { background: linear-gradient(135deg, #059669 0%, #10B981 50%, #34D399 100%); }
 .hero-travel  { background: linear-gradient(135deg, #7C3AED 0%, #A855F7 50%, #C084FC 100%); }
+.hero-ivivu   { background: linear-gradient(135deg, #F59E0B 0%, #F97316 50%, #EF4444 100%); }
 .hero h1 { color:#fff!important; font-size:2.2rem!important; font-weight:800!important; margin:0 0 .25rem!important; text-shadow:0 2px 8px rgba(0,0,0,.2); }
 .hero p  { color:rgba(255,255,255,.9)!important; font-size:.95rem!important; margin:0!important; }
 
@@ -94,6 +96,11 @@ st.markdown("""
     background:linear-gradient(135deg,#7C3AED,#A855F7)!important;
     box-shadow:0 2px 8px rgba(124,58,237,.35)!important;
 }
+/* ivivu tab active */
+.ota-ivivu [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+    background:linear-gradient(135deg,#F59E0B,#EF4444)!important;
+    box-shadow:0 2px 8px rgba(245,158,11,.35)!important;
+}
 
 [data-testid="stTabs"] [role="tabpanel"] { padding-top:0!important; }
 
@@ -131,6 +138,13 @@ st.markdown("""
     border:none!important; border-radius:12px!important; font-weight:700!important;
     font-size:1rem!important; padding:.7rem 1.5rem!important;
 }
+/* ── Primary button — ivivu ── */
+.ota-ivivu [data-testid="stButton"] button[kind="primary"] {
+    background:linear-gradient(135deg,#F59E0B,#EF4444)!important;
+    box-shadow:0 4px 14px rgba(245,158,11,.35)!important;
+    border:none!important; border-radius:12px!important; font-weight:700!important;
+    font-size:1rem!important; padding:.7rem 1.5rem!important;
+}
 [data-testid="stButton"] button[kind="primary"]:hover { transform:translateY(-1px)!important; }
 [data-testid="stButton"] button[kind="secondary"] {
     border-radius:10px!important; border:1.5px solid #E2E8F0!important; font-weight:600!important;
@@ -159,6 +173,7 @@ st.markdown("""
 .info-badge-tripcom { background:#EFF6FF; color:#007DFF; border:1px solid #BFDBFE; }
 .info-badge-mytour  { background:#ECFDF5; color:#059669; border:1px solid #A7F3D0; }
 .info-badge-travel  { background:#F5F3FF; color:#7C3AED; border:1px solid #DDD6FE; }
+.info-badge-ivivu   { background:#FFF7ED; color:#C2410C; border:1px solid #FED7AA; }
 
 /* ── Section label ── */
 .section-label { font-size:.82rem; font-weight:600; color:#6B7280; text-transform:uppercase; letter-spacing:.06em; margin-bottom:.3rem; }
@@ -173,6 +188,7 @@ st.markdown("""
 .result-header-tripcom { background:linear-gradient(135deg,#007DFF,#0056b3); }
 .result-header-mytour  { background:linear-gradient(135deg,#059669,#047857); }
 .result-header-travel  { background:linear-gradient(135deg,#7C3AED,#5B21B6); }
+.result-header-ivivu   { background:linear-gradient(135deg,#F59E0B,#C2410C); }
 .result-header h3 { margin:0; font-size:1.2rem; font-weight:700; color:#fff; }
 .result-badge { background:rgba(255,255,255,.25); color:#fff; border-radius:20px; padding:.2rem .8rem; font-size:.9rem; font-weight:700; margin-left:auto; }
 
@@ -200,7 +216,7 @@ today = date.today()
 st.markdown("<div style='padding:.5rem 0 .3rem'></div>", unsafe_allow_html=True)
 ota = st.radio(
     "Chọn OTA",
-    ["🟠 Agoda", "🔵 Trip.com", "🟢 Mytour.vn", "🟣 Travel.com.vn"],
+    ["🟠 Agoda", "🔵 Trip.com", "🟢 Mytour.vn", "🟣 Travel.com.vn", "🟡 iVIVU"],
     horizontal=True,
     label_visibility="collapsed",
     key="ota_radio",
@@ -215,10 +231,10 @@ if st.session_state.prev_ota != ota_name:
     st.session_state.scrape_results = None
     st.session_state.prev_ota = ota_name
 
-hero_class = {"Agoda": "hero-agoda", "Trip.com": "hero-tripcom", "Mytour.vn": "hero-mytour", "Travel.com.vn": "hero-travel"}[ota_name]
-ota_class  = {"Agoda": "ota-agoda",  "Trip.com": "ota-tripcom",  "Mytour.vn": "ota-mytour",  "Travel.com.vn": "ota-travel"}[ota_name]
+hero_class = {"Agoda": "hero-agoda", "Trip.com": "hero-tripcom", "Mytour.vn": "hero-mytour", "Travel.com.vn": "hero-travel", "iVIVU": "hero-ivivu"}[ota_name]
+ota_class  = {"Agoda": "ota-agoda",  "Trip.com": "ota-tripcom",  "Mytour.vn": "ota-mytour",  "Travel.com.vn": "ota-travel", "iVIVU": "ota-ivivu"}[ota_name]
 
-logo_map = {"Agoda": "🟠", "Trip.com": "🔵", "Mytour.vn": "🟢", "Travel.com.vn": "🟣"}
+logo_map = {"Agoda": "🟠", "Trip.com": "🔵", "Mytour.vn": "🟢", "Travel.com.vn": "🟣", "iVIVU": "🟡"}
 st.markdown(f"""
 <div class="hero {hero_class}">
   <h1>{logo_map[ota_name]} {ota_name} Hotel Scraper</h1>
@@ -585,6 +601,41 @@ elif ota_name == "Travel.com.vn":
                 "trigger_scrape": True,
             })
 
+# ── IVIVU ────────────────────────────────────────────────────────────────────
+elif ota_name == "iVIVU":
+    tab_i1, tab_i2 = st.tabs(["🔗  Dán URL trực tiếp", "ℹ️  Gợi ý"])
+
+    with tab_i1:
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div class="info-badge info-badge-ivivu">
+          💡 Truy cập <b>ivivu.com</b>, mở trang khách sạn theo điểm đến (vd: /khach-san-nha-trang), rồi dán URL vào đây.
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<div class='section-label'>🔗 URL iVIVU</div>", unsafe_allow_html=True)
+        iv_url = st.text_area(
+            "URL", placeholder="https://www.ivivu.com/khach-san-nha-trang",
+            height=90, key="ivivu_url", label_visibility="collapsed"
+        )
+        st.markdown("<div class='section-label'>🗺️ Tên điểm đến</div>", unsafe_allow_html=True)
+        iv_dest = st.text_input(
+            "Điểm đến", placeholder="VD: Nha Trang, Đà Lạt...",
+            key="ivivu_dest", label_visibility="collapsed"
+        )
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button(
+            "🚀  Bắt đầu thu thập",
+            disabled=not iv_url.strip() or not iv_dest.strip() or st.session_state.is_scraping,
+            key="ivivu_btn", use_container_width=True, type="primary"
+        ):
+            st.session_state.update({
+                "active_url": iv_url.strip(),
+                "active_destination": iv_dest.strip(),
+                "trigger_scrape": True,
+            })
+
+    with tab_i2:
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.info("iVIVU hiện hỗ trợ tốt nhất với URL dạng vùng, ví dụ: https://www.ivivu.com/khach-san-nha-trang")
+
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ── Scraping ──────────────────────────────────────────────────────────────────
@@ -608,6 +659,8 @@ if st.session_state.get("trigger_scrape"):
                 results = run_scrape_tripcom(url=active_url, destination=active_destination, status_callback=update_status)
             elif ota_name == "Travel.com.vn":
                 results = run_scrape_travel(url=active_url, destination=active_destination, status_callback=update_status)
+            elif ota_name == "iVIVU":
+                results = run_scrape_ivivu(url=active_url, destination=active_destination, status_callback=update_status)
             else:  # Mytour.vn
                 ci_str = st.session_state.get("check_in_str", "")
                 co_str = st.session_state.get("check_out_str", "")
@@ -662,7 +715,13 @@ if st.session_state.scrape_results:
     df = pd.DataFrame(results)
     active_destination = st.session_state.get("active_destination", "data")
 
-    header_class = {"Agoda": "result-header-agoda", "Trip.com": "result-header-tripcom", "Mytour.vn": "result-header-mytour", "Travel.com.vn": "result-header-travel"}.get(ota_name, "result-header-agoda")
+    header_class = {
+        "Agoda": "result-header-agoda",
+        "Trip.com": "result-header-tripcom",
+        "Mytour.vn": "result-header-mytour",
+        "Travel.com.vn": "result-header-travel",
+        "iVIVU": "result-header-ivivu",
+    }.get(ota_name, "result-header-agoda")
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
     st.markdown(f"""
@@ -674,14 +733,20 @@ if st.session_state.scrape_results:
     """, unsafe_allow_html=True)
 
     # ── Metrics ──
-    price_col = {"Agoda": "Giá/đêm (chưa gồm thuế)", "Trip.com": "Giá/đêm (VND)", "Mytour.vn": "Giá/đêm (VND)", "Travel.com.vn": "Giá/đêm (VND)"}.get(ota_name, "Giá/đêm (VND)")
+    price_col = {
+        "Agoda": "Giá/đêm (chưa gồm thuế)",
+        "Trip.com": "Giá/đêm (VND)",
+        "Mytour.vn": "Giá/đêm (VND)",
+        "Travel.com.vn": "Giá/đêm (VND)",
+        "iVIVU": "Giá/đêm (VND)",
+    }.get(ota_name, "Giá/đêm (VND)")
     m_cols = st.columns(5)
     m_cols[0].metric("🏨 Tổng", len(df))
     m_cols[1].metric("💰 Có giá", int(df[price_col].astype(bool).sum()) if price_col in df.columns else 0)
     m_cols[2].metric("⭐ Có sao", int(df["Hạng sao"].astype(bool).sum()) if "Hạng sao" in df.columns else 0)
     if ota_name == "Agoda":
         m_cols[3].metric("🍳 Có bữa ăn", int(df["Gói bữa ăn"].astype(bool).sum()) if "Gói bữa ăn" in df.columns else 0)
-    elif ota_name in ("Mytour.vn", "Travel.com.vn"):
+    elif ota_name in ("Mytour.vn", "Travel.com.vn", "iVIVU"):
         m_cols[3].metric("📝 Số đánh giá", int(df["Số đánh giá"].astype(bool).sum()) if "Số đánh giá" in df.columns else 0)
     else:
         m_cols[3].metric("🍳 Bữa ăn", "N/A")
@@ -740,6 +805,13 @@ if st.session_state.scrape_results:
             "Giá/đêm (chưa gồm thuế phí)": st.column_config.TextColumn("💸 Giá chưa thuế phí", width="medium"),
             "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá đã gồm thuế phí", width="medium"),
             "Thuế phí ước tính": st.column_config.TextColumn("🧾 Thuế phí", width="small"),
+            "Nguồn": st.column_config.TextColumn("🌐 Nguồn", width="small"),
+        })
+    elif ota_name == "iVIVU":
+        col_cfg.update({
+            "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ", width="large"),
+            "Số đánh giá": st.column_config.TextColumn("📝 Đánh giá", width="small"),
+            "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá/đêm (VND)", width="medium"),
             "Nguồn": st.column_config.TextColumn("🌐 Nguồn", width="small"),
         })
     else:  # Mytour
