@@ -2,10 +2,10 @@
 travel.com.vn hotel scraper.
 
 Strategy:
-1. Load page with Playwright (handles any JS-rendered content).
-2. Extract hotel cards from DOM using flexible selectors.
-3. Detect total pages from pagination; navigate page=2, page=3, …
-4. Returns: name, link, address, stars, rating, review count, price (VND), policy, source.
+1. Open the search page once with Playwright to capture the per-session JWT.
+2. Use requests to POST to api2.travel.com.vn/core/Hotel/search-hotel
+   for each page (pageIndex = 1, 2, …).
+3. Parse response.resultHotels from the JSON payload.
 
 URL format: https://travel.com.vn/hotels/khach-san-tai-{slug}.aspx
             ?room=1&in=DD-MM-YYYY&out=DD-MM-YYYY&adults=2&children=0
@@ -13,9 +13,13 @@ URL format: https://travel.com.vn/hotels/khach-san-tai-{slug}.aspx
 """
 
 import asyncio
+import json
 import re
 import shutil
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
+import time
+from urllib.parse import urlparse, parse_qs, quote
+
+import requests as _requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ---------------------------------------------------------------------------
@@ -77,11 +81,8 @@ CITY_MAP: dict[str, tuple[str, int, str]] = {
     "hai phong": ("hai-phong", 17, "Hải Phòng"),
 }
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
+API_URL = "https://api2.travel.com.vn/core/Hotel/search-hotel"
+PAGE_SIZE = 20
 
 
 def resolve_travel_city(destination: str) -> tuple[str, int, str] | None:
@@ -98,10 +99,7 @@ def resolve_travel_city(destination: str) -> tuple[str, int, str] | None:
 def build_travel_url(city_slug: str, city_id: int, city_name: str,
                      check_in: str, check_out: str,
                      rooms: int = 1, adults: int = 2, children: int = 0) -> str:
-    """
-    Build a travel.com.vn hotel listing URL.
-    check_in / check_out: DD-MM-YYYY
-    """
+    """Build a travel.com.vn hotel listing URL. check_in / check_out: DD-MM-YYYY"""
     encoded_name = quote(city_name)
     return (
         f"https://travel.com.vn/hotels/khach-san-tai-{city_slug}.aspx"
@@ -120,259 +118,199 @@ def get_chromium() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# DOM extraction helpers
+# Parse URL params to build the POST payload
 # ---------------------------------------------------------------------------
 
-HOTEL_CARD_SELECTORS = [
-    ".hotel-item",
-    ".item-hotel",
-    ".hotel-card",
-    ".result-item",
-    "[class*='hotel-item']",
-    "[class*='hotelItem']",
-    ".list-hotel > div",
-    ".hotel-list .item",
-    "li.hotel",
-    ".search-result-item",
-]
+def _url_to_payload(url: str, city_name_no_sign: str = "", city_title: str = "",
+                    page_index: int = 1) -> dict:
+    """Convert a travel.com.vn search URL into the API POST payload."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
 
-NAME_SELECTORS = [
-    "h2 a", "h3 a", ".hotel-name a", ".hotel-title a",
-    ".name a", ".title a", "a.hotel-name", "a.name",
-    ".hotel-name", ".hotel-title", "h2", "h3",
-]
+    def q(key, default=""):
+        v = qs.get(key)
+        return v[0] if v else default
 
-PRICE_SELECTORS = [
-    ".price-room", ".hotel-price", ".price strong",
-    ".price-sale", ".price-current", ".room-price",
-    ".price", "strong.price", ".sale-price",
-    "[class*='price']",
-]
+    city_id = q("hid") or q("cid") or ""
+    check_in = q("in", "")
+    check_out = q("out", "")
+    rooms = int(q("room", "1") or 1)
+    adults = int(q("adults", "2") or 2)
+    children = int(q("children", "0") or 0)
+    htitle = q("htitle", city_title)
 
-STAR_SELECTORS = [
-    ".star-rating", ".hotel-star", ".stars",
-    "[class*='star']",
-]
+    # Derive cityNameNoSign from URL path: /hotels/khach-san-tai-{slug}.aspx
+    slug = ""
+    path_parts = parsed.path.rstrip("/").split("/")
+    for part in reversed(path_parts):
+        if part.startswith("khach-san-tai-"):
+            slug = part.replace("khach-san-tai-", "").replace(".aspx", "")
+            break
 
-RATING_SELECTORS = [
-    ".rating-score", ".score", ".point",
-    ".hotel-rating .score", ".rating-value",
-    "[class*='rating']", "[class*='score']",
-]
+    if not city_name_no_sign:
+        city_name_no_sign = slug or "unknown"
 
-ADDR_SELECTORS = [
-    ".hotel-address", ".address", ".location",
-    "[class*='address']", "[class*='location']",
-]
+    return {
+        "cityId": str(city_id),
+        "cityNameNoSign": city_name_no_sign,
+        "hotelId": str(city_id),
+        "hotelTitle": htitle,
+        "propertyIds": [str(city_id), str(city_id)],
+        "checkIn": check_in,
+        "checkOut": check_out,
+        "rooms": rooms,
+        "adults": adults,
+        "children": children,
+        "childrenAges": [],
+        "pageIndex": page_index,
+        "pageSize": PAGE_SIZE,
+        "accommodationTypes": [],
+        "facilities": [],
+    }
 
 
-def _text(el) -> str:
-    """Safe innerText strip."""
+# ---------------------------------------------------------------------------
+# Format hotel record
+# ---------------------------------------------------------------------------
+
+def _fmt_vnd(price) -> str:
+    if price is None:
+        return ""
     try:
-        return (el.inner_text() or "").strip()
+        v = float(price)
+        if v <= 0:
+            return ""
+        return f"{v:,.0f} VND".replace(",", ".")
     except Exception:
+        return str(price)
+
+
+def _fmt_stars(rating) -> str:
+    if rating is None:
         return ""
+    try:
+        v = float(rating)
+        if v <= 0:
+            return ""
+        return f"{v:g} sao"
+    except Exception:
+        return str(rating)
 
 
-async def _try_first(card, selectors: list[str]) -> str:
-    """Try a list of CSS selectors, return text of first match."""
-    for sel in selectors:
-        try:
-            el = card.locator(sel).first
-            if await el.count() > 0:
-                t = (await el.inner_text()).strip()
-                if t:
-                    return t
-        except Exception:
-            pass
-    return ""
-
-
-async def _try_attr(card, selectors: list[str], attr: str) -> str:
-    for sel in selectors:
-        try:
-            el = card.locator(sel).first
-            if await el.count() > 0:
-                v = await el.get_attribute(attr)
-                if v and v.strip():
-                    return v.strip()
-        except Exception:
-            pass
-    return ""
-
-
-def _parse_vnd(text: str) -> str:
-    """Extract cheapest VND price from text."""
-    if not text:
+def _fmt_score(score) -> str:
+    if score is None:
         return ""
-    nums = re.findall(r'[\d.,]+', text.replace("đ", "").replace("₫", ""))
-    parsed = []
-    for n in nums:
-        clean = n.replace(".", "").replace(",", "")
-        try:
-            v = int(clean)
-            if v >= 50000:
-                parsed.append(v)
-        except Exception:
-            pass
-    if not parsed:
-        return ""
-    return f"{min(parsed):,.0f} VND".replace(",", ".")
+    try:
+        v = float(score)
+        if v <= 0:
+            return ""
+        return f"{v}/10"
+    except Exception:
+        return str(score)
 
 
-def _parse_stars(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r'(\d(?:[.,]\d)?)\s*[★⭐sao*]', text, re.I)
-    if m:
-        return f"{m.group(1)} sao"
-    # Count star characters
-    count = text.count("★") or text.count("⭐") or text.count("*")
-    if count:
-        return f"{count} sao"
-    return ""
+def _hotel_url(hotel: dict, city_slug: str = "") -> str:
+    """Build a best-guess hotel detail URL."""
+    hid = hotel.get("hotelId", "")
+    name = hotel.get("hotelName", "")
+    # Strip prefix like AGODA_, BOOKING_
+    raw_id = re.sub(r'^[A-Z_]+_', '', str(hid))
+    # Slugify name
+    slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+    if raw_id:
+        return f"https://travel.com.vn/hotels/chi-tiet-{slug}-{raw_id}.aspx"
+    return f"https://travel.com.vn/hotels/"
 
 
-def _parse_score(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r'(\d+(?:[.,]\d+)?)', text)
-    if m:
-        v = float(m.group(1).replace(",", "."))
-        if 1 <= v <= 10:
-            return f"{v}/10"
-        if 10 < v <= 100:
-            return f"{v/10:.1f}/10"
-    return ""
+def _parse_hotel(hotel: dict, destination: str, city_slug: str) -> dict:
+    return {
+        "Tên khách sạn": hotel.get("hotelName", ""),
+        "Link khách sạn": _hotel_url(hotel, city_slug),
+        "Địa chỉ": (hotel.get("address") or "").strip(),
+        "Hạng sao": _fmt_stars(hotel.get("starRating")),
+        "Loại": hotel.get("typeTitle", ""),
+        "Điểm đánh giá": _fmt_score(hotel.get("reviewScore")),
+        "Số đánh giá": str(int(hotel.get("reviewCount") or 0)) if hotel.get("reviewCount") else "",
+        "Giá/đêm (VND)": _fmt_vnd(hotel.get("price")),
+        "Chính sách hoàn hủy": "",
+        "Nguồn": "travel.com.vn",
+        "Điểm đến": destination,
+    }
 
 
-async def _extract_hotels_from_page(page, destination: str, status_callback) -> list[dict]:
-    """Extract all hotel cards from current page DOM."""
-    hotels = []
-    card_sel = None
+# ---------------------------------------------------------------------------
+# JWT capture via Playwright (one-time page load)
+# ---------------------------------------------------------------------------
 
-    for sel in HOTEL_CARD_SELECTORS:
-        try:
-            count = await page.locator(sel).count()
-            if count >= 2:
-                card_sel = sel
-                break
-        except Exception:
-            pass
+async def _capture_jwt(url: str, chromium: str, status_callback) -> tuple[str, str, dict] | None:
+    """
+    Open the search URL once, capture:
+      - JWT token from Authorization header
+      - ClientId header
+      - First API response (to save a round-trip)
+    Returns (jwt, client_id, first_response_json) or None on failure.
+    """
+    captured: dict = {}
 
-    if not card_sel:
-        status_callback("  ⚠️ Không tìm được hotel card selector")
-        return []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            executable_path=chromium,
+            args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-gpu",
+                "--single-process", "--no-zygote",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        ctx = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
+            locale="vi-VN",
+            extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9"},
+        )
+        page = await ctx.new_page()
+        await page.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+        )
 
-    cards = page.locator(card_sel)
-    n = await cards.count()
-    status_callback(f"  🃏 Tìm thấy {n} cards ({card_sel})")
-
-    for i in range(n):
-        try:
-            card = cards.nth(i)
-
-            # Name + link
-            name = ""
-            link = ""
-            for sel in NAME_SELECTORS:
+        async def on_response(resp):
+            if "search-hotel" in resp.url and "jwt" not in captured:
+                h = dict(resp.request.headers)
+                captured["jwt"] = h.get("authorization", "")
+                captured["client_id"] = h.get("clientid", "")
+                captured["req_body"] = resp.request.post_data or ""
                 try:
-                    el = card.locator(sel).first
-                    if await el.count() > 0:
-                        name = (await el.inner_text()).strip()
-                        href = await el.get_attribute("href")
-                        if href:
-                            link = href if href.startswith("http") else f"https://travel.com.vn{href}"
-                        if name:
-                            break
+                    captured["resp_json"] = await resp.json()
                 except Exception:
                     pass
 
-            if not name:
-                continue
+        page.on("response", on_response)
 
-            price_raw = await _try_first(card, PRICE_SELECTORS)
-            price = _parse_vnd(price_raw)
+        status_callback("🌐 Đang mở travel.com.vn để lấy token xác thực...")
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=40000)
+        except PlaywrightTimeoutError:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            except Exception:
+                pass
 
-            stars_raw = await _try_attr(card, STAR_SELECTORS, "data-star") or \
-                        await _try_attr(card, STAR_SELECTORS, "class") or \
-                        await _try_first(card, STAR_SELECTORS)
-            stars = _parse_stars(stars_raw)
+        # Wait for API response (up to 10s)
+        for _ in range(20):
+            if "jwt" in captured:
+                break
+            await asyncio.sleep(0.5)
 
-            rating_raw = await _try_first(card, RATING_SELECTORS)
-            rating = _parse_score(rating_raw)
+        await browser.close()
 
-            addr = await _try_first(card, ADDR_SELECTORS)
-
-            # Review count
-            review_raw = await _try_first(card, [".review-count", ".num-review", ".count-review",
-                                                  "[class*='review']", ".comment-count"])
-            review_count = ""
-            m = re.search(r'(\d+)', review_raw)
-            if m:
-                review_count = m.group(1)
-
-            # Cancellation
-            policy_raw = await _try_first(card, [".cancel-policy", ".free-cancel", ".policy",
-                                                  "[class*='cancel']", "[class*='policy']"])
-            if "miễn phí" in policy_raw.lower() or "free" in policy_raw.lower():
-                policy = "Hủy miễn phí"
-            elif policy_raw:
-                policy = policy_raw[:60]
-            else:
-                policy = ""
-
-            hotels.append({
-                "Tên khách sạn": name,
-                "Link khách sạn": link,
-                "Địa chỉ": addr,
-                "Hạng sao": stars,
-                "Điểm đánh giá": rating,
-                "Số đánh giá": review_count,
-                "Giá/đêm (VND)": price,
-                "Chính sách hoàn hủy": policy,
-                "Nguồn": "travel.com.vn",
-                "Điểm đến": destination,
-            })
-        except Exception:
-            continue
-
-    return hotels
-
-
-async def _detect_total_pages(page) -> int:
-    """Detect the last page number from pagination links."""
-    try:
-        # Try to find pagination and get last page number
-        pager = page.locator(".pagination, .pager, [class*='paging'], [class*='paginat']")
-        if await pager.count() > 0:
-            pager_text = await pager.first.inner_text()
-            nums = re.findall(r'\b(\d+)\b', pager_text)
-            if nums:
-                return max(int(n) for n in nums)
-        # Try page links directly
-        links = page.locator("a[href*='page='], a[href*='Page='], a[href*='p=']")
-        if await links.count() > 0:
-            nums = []
-            for idx in range(await links.count()):
-                href = await links.nth(idx).get_attribute("href") or ""
-                m = re.search(r'[Pp]age=(\d+)|[&?]p=(\d+)', href)
-                if m:
-                    nums.append(int(m.group(1) or m.group(2)))
-            if nums:
-                return max(nums)
-    except Exception:
-        pass
-    return 1
-
-
-def _make_page_n_url(base_url: str, page_num: int) -> str:
-    """Add or replace page parameter in URL."""
-    parsed = urlparse(base_url)
-    params = parse_qs(parsed.query, keep_blank_values=True)
-    params["page"] = [str(page_num)]
-    new_query = urlencode({k: v[0] for k, v in params.items()})
-    return urlunparse(parsed._replace(query=new_query))
+    if "jwt" not in captured or not captured["jwt"]:
+        return None
+    return captured["jwt"], captured["client_id"], captured.get("resp_json", {})
 
 
 # ---------------------------------------------------------------------------
@@ -394,86 +332,114 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
     if not chromium:
         raise RuntimeError("Không tìm thấy Chromium. Hãy cài 'chromium-browser'.")
 
-    results: list[dict] = []
-    seen_keys: set[str] = set()
+    # Step 1: Capture JWT via Playwright
+    result = await _capture_jwt(url, chromium, status_callback)
+    if not result:
+        raise RuntimeError("Không thể lấy token xác thực từ travel.com.vn. Hãy thử lại.")
 
-    def _add(hotels: list[dict]) -> int:
+    jwt, client_id, first_resp = result
+    status_callback(f"✅ Đã lấy được token xác thực")
+
+    # Derive city info from URL
+    parsed_url = urlparse(url)
+    slug = ""
+    for part in reversed(parsed_url.path.rstrip("/").split("/")):
+        if part.startswith("khach-san-tai-"):
+            slug = part.replace("khach-san-tai-", "").replace(".aspx", "")
+            break
+
+    # HTTP session for all subsequent calls
+    sess = _requests.Session()
+    sess.headers.update({
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": "https://travel.com.vn",
+        "Referer": "https://travel.com.vn/",
+        "Authorization": jwt,
+        "ClientId": client_id,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "vi-VN,vi;q=0.9",
+    })
+
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(hotels: list[dict], city_slug: str) -> int:
         added = 0
         for h in hotels:
-            key = h.get("Link khách sạn") or h.get("Tên khách sạn") or ""
-            key = key.lower().strip()
-            if key and key not in seen_keys:
-                seen_keys.add(key)
-                results.append(h)
+            key = (h.get("hotelId") or h.get("hotelName") or "").lower().strip()
+            if key and key not in seen:
+                seen.add(key)
+                results.append(_parse_hotel(h, destination, city_slug))
                 added += 1
         return added
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            executable_path=chromium,
-            args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage", "--no-first-run",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        ctx = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 768},
-            locale="vi-VN",
-            extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9"},
-        )
-        page = await ctx.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
+    def _extract_hotels(resp_json: dict) -> list[dict]:
+        resp = resp_json.get("response") or {}
+        if isinstance(resp, dict):
+            rh = resp.get("resultHotels") or []
+            return rh if isinstance(rh, list) else []
+        if isinstance(resp, list):
+            return resp
+        return []
 
-        # ── Page 1 ──────────────────────────────────────────────────────────
-        status_callback("🌐 Đang mở travel.com.vn...")
+    # Step 2: Process first response already captured
+    base_payload = _url_to_payload(url, city_name_no_sign=slug, city_title=destination, page_index=1)
+    total_record = first_resp.get("totalRecord") or 0
+    hotels_p1 = _extract_hotels(first_resp)
+    added = _add(hotels_p1, slug)
+    status_callback(f"📄 Trang 1: {len(hotels_p1)} khách sạn, tổng={total_record}")
+
+    # Determine total pages
+    total_pages_raw = first_resp.get("totalPage")
+    if total_pages_raw:
+        total_pages = int(total_pages_raw)
+    elif total_record > 0:
+        total_pages = max(1, (total_record + PAGE_SIZE - 1) // PAGE_SIZE)
+    else:
+        total_pages = 1
+
+    status_callback(f"📊 Tổng {total_record} khách sạn — {total_pages} trang")
+
+    # Step 3: Pages 2+
+    consecutive_empty = 0
+    for pg in range(2, min(total_pages + 1, 101)):
+        if len(results) >= 2000:
+            status_callback("⚠️ Đạt giới hạn 2000.")
+            break
+
+        status_callback(f"📄 Trang {pg}/{total_pages}...")
+        payload = dict(base_payload)
+        payload["pageIndex"] = pg
+
         try:
-            await page.goto(url, wait_until="networkidle", timeout=45000)
-        except PlaywrightTimeoutError:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            r = sess.post(API_URL, json=payload, timeout=15)
+            r.raise_for_status()
+            resp_json = r.json()
+        except Exception as e:
+            status_callback(f"  ⚠️ Lỗi trang {pg}: {e}")
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                break
+            continue
 
-        await asyncio.sleep(3)
+        hotels_pg = _extract_hotels(resp_json)
+        added = _add(hotels_pg, slug)
+        status_callback(f"  → +{added} mới (tổng: {len(results)})")
 
-        total_pages = await _detect_total_pages(page)
-        status_callback(f"📊 Phát hiện {total_pages} trang")
-
-        hotels_p1 = await _extract_hotels_from_page(page, destination, status_callback)
-        added = _add(hotels_p1)
-        status_callback(f"📄 Trang 1: {len(hotels_p1)} khách sạn, +{added} mới (tổng: {len(results)})")
-
-        # ── Pages 2+ ─────────────────────────────────────────────────────────
-        consecutive_empty = 0
-        for pg in range(2, min(total_pages + 1, 81)):
-            if len(results) >= 2000:
-                status_callback("⚠️ Đạt giới hạn 2000.")
+        if added > 0:
+            consecutive_empty = 0
+        else:
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                status_callback("⚠️ 3 trang liên tiếp không có kết quả mới, dừng.")
                 break
 
-            status_callback(f"📄 Trang {pg}/{total_pages}...")
-            pg_url = _make_page_n_url(url, pg)
+        time.sleep(0.3)
 
-            try:
-                await page.goto(pg_url, wait_until="networkidle", timeout=30000)
-            except PlaywrightTimeoutError:
-                await page.goto(pg_url, wait_until="domcontentloaded", timeout=20000)
-
-            await asyncio.sleep(2)
-
-            hotels_pg = await _extract_hotels_from_page(page, destination, status_callback)
-            added = _add(hotels_pg)
-            status_callback(f"  → +{added} mới (tổng: {len(results)})")
-
-            if added > 0:
-                consecutive_empty = 0
-            else:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    status_callback("⚠️ 3 trang liên tiếp không có mới, dừng.")
-                    break
-
-        await browser.close()
-
+    status_callback(f"✅ Hoàn thành: {len(results)} khách sạn từ travel.com.vn")
     return results
