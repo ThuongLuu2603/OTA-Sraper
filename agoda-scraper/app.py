@@ -10,6 +10,8 @@ from scraper_tripcom import build_tripcom_url, resolve_trip_city, run_scrape_tri
 from scraper_mytour import build_mytour_url, resolve_mytour_city, run_scrape_mytour
 from scraper_travelcomvn import build_travel_url, resolve_travel_city, run_scrape_travel
 from scraper_ivivu import run_scrape_ivivu, resolve_ivivu_region_url
+from scraper_findtourgo import build_findtourgo_url, run_scrape_findtourgo_tours
+from scraper_travelcomvn_tour import build_travel_tour_url, resolve_travel_tour_slug, run_scrape_travel_tour
 
 st.set_page_config(
     page_title="OTA Hotel Scraper",
@@ -35,6 +37,82 @@ def normalize_agoda_direct_url(raw_url: str) -> str:
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
     except Exception:
         return raw_url.strip()
+
+
+HOTEL_RESULT_COLUMNS = [
+    "Phân khúc",
+    "Nguồn",
+    "Tỉnh thành / Điểm đến",
+    "Tên khách sạn",
+    "Địa chỉ",
+    "Hạng sao",
+    "Điểm đánh giá",
+    "Số đánh giá",
+    "Giá/đêm (VND)",
+    "Giá/đêm (chưa gồm thuế)",
+    "Giá/đêm (đã gồm thuế)",
+    "Thuế phí ước tính",
+    "Gói bữa ăn",
+    "Chính sách hoàn hủy",
+    "Link khách sạn",
+]
+
+
+TOUR_RESULT_COLUMNS = [
+    "Phân khúc",
+    "Nguồn",
+    "Quốc gia",
+    "Tên tour",
+    "Mã tour",
+    "Công ty lữ hành",
+    "Thời lượng (ngày)",
+    "Giá từ",
+    "Tiền tệ",
+    "Điểm đánh giá",
+    "Xếp hạng nội bộ",
+    "Điểm khởi hành",
+    "Phương tiện",
+    "Ngày khởi hành",
+    "Link tour",
+]
+
+
+def _pick_text(row: dict, *keys: str) -> str:
+    for k in keys:
+        if k in row:
+            v = row.get(k)
+            txt = "" if v is None else str(v).strip()
+            if txt:
+                return txt
+    return ""
+
+
+def normalize_hotel_rows(rows: list, source: str, destination: str) -> list:
+    out = []
+    for item in rows or []:
+        row = item if isinstance(item, dict) else {}
+        price_pre_tax = _pick_text(row, "Giá/đêm (chưa gồm thuế)", "Giá/đêm (chưa gồm thuế phí)")
+        price_tax = _pick_text(row, "Giá/đêm (đã gồm thuế)", "Giá/đêm (VND)")
+        price_vnd = _pick_text(row, "Giá/đêm (VND)", "Giá/đêm (đã gồm thuế)", "Giá/đêm (chưa gồm thuế)")
+        normalized = {
+            "Phân khúc": "Hotel",
+            "Nguồn": source,
+            "Tỉnh thành / Điểm đến": _pick_text(row, "Tỉnh thành / Điểm đến", "Tỉnh/Thành") or destination,
+            "Tên khách sạn": _pick_text(row, "Tên khách sạn"),
+            "Địa chỉ": _pick_text(row, "Địa chỉ", "Địa điểm nổi bật"),
+            "Hạng sao": _pick_text(row, "Hạng sao"),
+            "Điểm đánh giá": _pick_text(row, "Điểm đánh giá"),
+            "Số đánh giá": _pick_text(row, "Số đánh giá"),
+            "Giá/đêm (VND)": price_vnd,
+            "Giá/đêm (chưa gồm thuế)": price_pre_tax,
+            "Giá/đêm (đã gồm thuế)": price_tax,
+            "Thuế phí ước tính": _pick_text(row, "Thuế phí ước tính"),
+            "Gói bữa ăn": _pick_text(row, "Gói bữa ăn"),
+            "Chính sách hoàn hủy": _pick_text(row, "Chính sách hoàn hủy"),
+            "Link khách sạn": _pick_text(row, "Link khách sạn"),
+        }
+        out.append(normalized)
+    return out
 
 st.markdown("""
 <style>
@@ -204,6 +282,7 @@ st.markdown("""
 for key, default in [
     ("scrape_results", None), ("is_scraping", False),
     ("active_destination", ""), ("active_url", ""),
+    ("active_segment", "Hotel"), ("active_source", "Agoda"),
     ("trigger_scrape", False), ("trip_city_info", None),
     ("mytour_city_info", None), ("check_in_str", ""), ("check_out_str", ""),
 ]:
@@ -212,40 +291,245 @@ for key, default in [
 
 today = date.today()
 
-# ── OTA selector (radio — more reliable in Streamlit iframes) ──────────────
-st.markdown("<div style='padding:.5rem 0 .3rem'></div>", unsafe_allow_html=True)
-ota = st.radio(
-    "Chọn OTA",
-    ["🟠 Agoda", "🔵 Trip.com", "🟢 Mytour.vn", "🟣 Travel.com.vn", "🟡 iVIVU"],
-    horizontal=True,
-    label_visibility="collapsed",
-    key="ota_radio",
-)
-# Normalize to plain name
-ota_name = ota.split(" ", 1)[1]  # "Agoda", "Trip.com", "Mytour.vn"
+# ── Segment + source selector ───────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Bộ chọn dữ liệu")
+    segment = st.radio(
+        "Chọn phân khúc",
+        ["🏨 Hotel", "🧭 Tour"],
+        horizontal=False,
+        key="segment_radio",
+    )
+segment_name = segment.split(" ", 1)[1]
 
-# Clear results if OTA changed
-if "prev_ota" not in st.session_state:
-    st.session_state.prev_ota = ota_name
-if st.session_state.prev_ota != ota_name:
+if segment_name == "Hotel":
+    with st.sidebar:
+        ota = st.radio(
+            "Chọn OTA Hotel",
+            ["🟠 Agoda", "🔵 Trip.com", "🟢 Mytour.vn", "🟣 Travel.com.vn", "🟡 iVIVU"],
+            horizontal=False,
+            key="ota_radio",
+        )
+    ota_name = ota.split(" ", 1)[1]
+else:
+    with st.sidebar:
+        tour_source = st.radio(
+            "Chọn nguồn Tour",
+            ["🧭 FindTourGo", "🟣 Travel.com.vn"],
+            horizontal=False,
+            key="tour_source_radio",
+        )
+    ota = tour_source
+    ota_name = tour_source.split(" ", 1)[1]
+
+# Clear results if selector changed
+selector_key = f"{segment_name}:{ota_name}"
+if "prev_selector" not in st.session_state:
+    st.session_state.prev_selector = selector_key
+if st.session_state.prev_selector != selector_key:
     st.session_state.scrape_results = None
-    st.session_state.prev_ota = ota_name
+    st.session_state.prev_selector = selector_key
 
-hero_class = {"Agoda": "hero-agoda", "Trip.com": "hero-tripcom", "Mytour.vn": "hero-mytour", "Travel.com.vn": "hero-travel", "iVIVU": "hero-ivivu"}[ota_name]
-ota_class  = {"Agoda": "ota-agoda",  "Trip.com": "ota-tripcom",  "Mytour.vn": "ota-mytour",  "Travel.com.vn": "ota-travel", "iVIVU": "ota-ivivu"}[ota_name]
+hero_class = {
+    "Agoda": "hero-agoda",
+    "Trip.com": "hero-tripcom",
+    "Mytour.vn": "hero-mytour",
+    "Travel.com.vn": "hero-travel",
+    "iVIVU": "hero-ivivu",
+    "FindTourGo": "hero-tripcom",
+}[ota_name]
+ota_class = {
+    "Agoda": "ota-agoda",
+    "Trip.com": "ota-tripcom",
+    "Mytour.vn": "ota-mytour",
+    "Travel.com.vn": "ota-travel",
+    "iVIVU": "ota-ivivu",
+    "FindTourGo": "ota-tripcom",
+}[ota_name]
 
-logo_map = {"Agoda": "🟠", "Trip.com": "🔵", "Mytour.vn": "🟢", "Travel.com.vn": "🟣", "iVIVU": "🟡"}
+logo_map = {
+    "Agoda": "🟠",
+    "Trip.com": "🔵",
+    "Mytour.vn": "🟢",
+    "Travel.com.vn": "🟣",
+    "iVIVU": "🟡",
+    "FindTourGo": "🧭",
+}
+title_suffix = "Hotel Scraper" if segment_name == "Hotel" else "Tour Scraper"
+subtitle = (
+    "Thu thập dữ liệu khách sạn · Phân tích giá · Xuất Excel / CSV"
+    if segment_name == "Hotel"
+    else "Thu thập dữ liệu tour · Lấy ngày khởi hành · Xuất Excel / CSV"
+)
 st.markdown(f"""
 <div class="hero {hero_class}">
-  <h1>{logo_map[ota_name]} {ota_name} Hotel Scraper</h1>
-  <p>Thu thập dữ liệu khách sạn · Phân tích giá · Xuất Excel / CSV</p>
+  <h1>{logo_map[ota_name]} {ota_name} {title_suffix}</h1>
+  <p>{subtitle}</p>
 </div>
 """, unsafe_allow_html=True)
 
 st.markdown(f"<div class='{ota_class}'>", unsafe_allow_html=True)
 
+# ── TOUR SOURCES ────────────────────────────────────────────────────────────
+if segment_name == "Tour":
+    if ota_name == "FindTourGo":
+        tab_f1, tab_f2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
+
+        with tab_f1:
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+            st.markdown("""<div class="info-badge info-badge-tripcom">
+              💡 Ví dụ country code: <b>CN</b>, <b>VN</b>, <b>JP</b>. Kết quả có kèm cột <b>Ngày khởi hành</b>.
+            </div>""", unsafe_allow_html=True)
+            fc1, fc2 = st.columns(2, gap="medium")
+            with fc1:
+                st.markdown("<div class='section-label'>🌍 Country code (where)</div>", unsafe_allow_html=True)
+                tour_country = st.text_input("Country", value="CN", key="tour_country", label_visibility="collapsed")
+                st.caption("Nhập mã 2 ký tự (CN, VN, JP...) hoặc tên nước (Trung Quốc, China...)")
+            with fc2:
+                st.markdown("<div class='section-label'>💱 Tiền tệ</div>", unsafe_allow_html=True)
+                tour_currency = st.selectbox("Currency", ["USD", "VND", "EUR", "JPY", "SGD"], index=0, key="tour_currency", label_visibility="collapsed")
+
+            fc3, fc4 = st.columns(2, gap="medium")
+            with fc3:
+                st.markdown("<div class='section-label'>📅 Từ ngày</div>", unsafe_allow_html=True)
+                tour_start = st.date_input("Tour start", value=today + timedelta(days=7), min_value=today, key="tour_start", label_visibility="collapsed")
+            with fc4:
+                st.markdown("<div class='section-label'>📅 Đến ngày</div>", unsafe_allow_html=True)
+                tour_end = st.date_input("Tour end", value=today + timedelta(days=37), min_value=today + timedelta(days=1), key="tour_end", label_visibility="collapsed")
+
+            tour_btn_disabled = tour_start > tour_end
+            if tour_btn_disabled:
+                st.error("⚠️ Ngày kết thúc phải sau hoặc bằng ngày bắt đầu.")
+
+            tour_url = build_findtourgo_url(
+                country_code=tour_country.strip(),
+                tour_period_start=tour_start.strftime("%Y-%m-%d"),
+                tour_period_end=tour_end.strftime("%Y-%m-%d"),
+                currency=tour_currency,
+                locale="vi",
+            )
+            with st.expander("👁️ Xem URL sẽ được scrape"):
+                st.code(tour_url, language="text")
+
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            if st.button(
+                "🚀  Bắt đầu thu thập",
+                disabled=tour_btn_disabled or not tour_country.strip() or st.session_state.is_scraping,
+                key="tour_form_btn", use_container_width=True, type="primary",
+            ):
+                st.session_state.update({
+                    "active_url": tour_url,
+                    "active_destination": tour_country.strip().upper(),
+                    "active_segment": "Tour",
+                    "active_source": "FindTourGo",
+                    "_tour_country": tour_country.strip().upper(),
+                    "_tour_period_start": tour_start.strftime("%Y-%m-%d"),
+                    "_tour_period_end": tour_end.strftime("%Y-%m-%d"),
+                    "_tour_currency": tour_currency,
+                    "trigger_scrape": True,
+                })
+
+        with tab_f2:
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+            st.markdown("<div class='section-label'>🔗 URL FindTourGo</div>", unsafe_allow_html=True)
+            tour_direct_url = st.text_area(
+                "URL",
+                placeholder="https://findtourgo.com/vi/country/china?tourPeriodEnd=2026-04-30&tourPeriodStart=2026-04-01&where=CN&currency=USD",
+                height=90,
+                key="tour_url_direct",
+                label_visibility="collapsed",
+            )
+            st.markdown("<div class='section-label'>🌍 Country code (tuỳ chọn)</div>", unsafe_allow_html=True)
+            tour_direct_country = st.text_input(
+                "Country code override",
+                value="",
+                placeholder="VD: CN",
+                key="tour_country_direct",
+                label_visibility="collapsed",
+            )
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            if st.button(
+                "🚀  Bắt đầu thu thập",
+                disabled=not tour_direct_url.strip() or st.session_state.is_scraping,
+                key="tour_url_btn", use_container_width=True, type="primary",
+            ):
+                st.session_state.update({
+                    "active_url": tour_direct_url.strip(),
+                    "active_destination": (tour_direct_country.strip() or "TOUR").upper(),
+                    "active_segment": "Tour",
+                    "active_source": "FindTourGo",
+                    "_tour_country": tour_direct_country.strip().upper(),
+                    "_tour_period_start": "",
+                    "_tour_period_end": "",
+                    "_tour_currency": "",
+                    "trigger_scrape": True,
+                })
+    else:  # Travel.com.vn tour
+        tab_t1, tab_t2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
+
+        with tab_t1:
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+            st.markdown("""<div class="info-badge info-badge-travel">
+              💡 Tour Travel.com.vn sẽ lấy: tên tour, mã tour, khởi hành, thời gian, giá và <b>ngày khởi hành</b>.
+            </div>""", unsafe_allow_html=True)
+            tc1, tc2 = st.columns(2, gap="medium")
+            with tc1:
+                st.markdown("<div class='section-label'>🌍 Điểm đến tour</div>", unsafe_allow_html=True)
+                tv_tour_dest = st.text_input("Điểm đến tour", value="Trung Quốc", key="tv_tour_dest", label_visibility="collapsed")
+            with tc2:
+                st.markdown("<div class='section-label'>📅 Từ ngày</div>", unsafe_allow_html=True)
+                tv_tour_from = st.date_input("fromDate", value=today + timedelta(days=1), min_value=today, key="tv_tour_from", label_visibility="collapsed")
+
+            tv_slug = resolve_travel_tour_slug(tv_tour_dest.strip())
+            tv_tour_url = build_travel_tour_url(tv_slug, tv_tour_from.strftime("%Y-%m-%d"))
+            with st.expander("👁️ Xem URL sẽ được scrape"):
+                st.code(tv_tour_url, language="text")
+
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            if st.button(
+                "🚀  Bắt đầu thu thập",
+                disabled=not tv_tour_dest.strip() or st.session_state.is_scraping,
+                key="travel_tour_form_btn", use_container_width=True, type="primary",
+            ):
+                st.session_state.update({
+                    "active_url": tv_tour_url,
+                    "active_destination": tv_tour_dest.strip(),
+                    "active_segment": "Tour",
+                    "active_source": "Travel.com.vn",
+                    "trigger_scrape": True,
+                })
+
+        with tab_t2:
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+            st.markdown("<div class='section-label'>🔗 URL Travel.com.vn tour</div>", unsafe_allow_html=True)
+            travel_tour_direct_url = st.text_area(
+                "URL",
+                placeholder="https://travel.com.vn/du-lich-trung-quoc.aspx?fromDate=2026-03-30",
+                height=90,
+                key="travel_tour_direct_url",
+                label_visibility="collapsed",
+            )
+            st.markdown("<div class='section-label'>📍 Nhãn điểm đến</div>", unsafe_allow_html=True)
+            travel_tour_dest = st.text_input(
+                "Điểm đến", placeholder="VD: Trung Quốc",
+                key="travel_tour_dest", label_visibility="collapsed",
+            )
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            if st.button(
+                "🚀  Bắt đầu thu thập",
+                disabled=not travel_tour_direct_url.strip() or st.session_state.is_scraping,
+                key="travel_tour_url_btn", use_container_width=True, type="primary",
+            ):
+                st.session_state.update({
+                    "active_url": travel_tour_direct_url.strip(),
+                    "active_destination": travel_tour_dest.strip() or "Travel Tour",
+                    "active_segment": "Tour",
+                    "active_source": "Travel.com.vn",
+                    "trigger_scrape": True,
+                })
+
 # ── AGODA ────────────────────────────────────────────────────────────────────
-if ota_name == "Agoda":
+elif ota_name == "Agoda":
     tab1, tab2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
 
     with tab1:
@@ -299,7 +583,13 @@ if ota_name == "Agoda":
         if st.button("🚀  Bắt đầu thu thập", disabled=btn_disabled or not destination_form or st.session_state.is_scraping,
                      key="agoda_form_btn", use_container_width=True, type="primary"):
             if url_preview:
-                st.session_state.update({"active_url": url_preview, "active_destination": destination_form, "trigger_scrape": True})
+                st.session_state.update({
+                    "active_url": url_preview,
+                    "active_destination": destination_form,
+                    "active_segment": "Hotel",
+                    "active_source": ota_name,
+                    "trigger_scrape": True,
+                })
 
     with tab2:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
@@ -316,7 +606,13 @@ if ota_name == "Agoda":
                      disabled=not direct_url.strip() or not dest_url_tab.strip() or st.session_state.is_scraping,
                      key="agoda_url_btn", use_container_width=True, type="primary"):
             pasted = normalize_agoda_direct_url(direct_url)
-            st.session_state.update({"active_url": pasted, "active_destination": dest_url_tab.strip(), "trigger_scrape": True})
+            st.session_state.update({
+                "active_url": pasted,
+                "active_destination": dest_url_tab.strip(),
+                "active_segment": "Hotel",
+                "active_source": ota_name,
+                "trigger_scrape": True,
+            })
 
 # ── TRIP.COM ─────────────────────────────────────────────────────────────────
 elif ota_name == "Trip.com":
@@ -378,7 +674,7 @@ elif ota_name == "Trip.com":
                                     check_out=trip_checkout.strftime("%Y-%m-%d"),
                                     rooms=trip_rooms, adults=trip_adults, children=trip_children)
             st.session_state.update({"active_url": url, "active_destination": trip_dest.strip(), "trigger_scrape": True,
-                                      "trip_city_info": trip_city_info})
+                                      "trip_city_info": trip_city_info, "active_segment": "Hotel", "active_source": ota_name})
 
     with tab_t2:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
@@ -398,6 +694,8 @@ elif ota_name == "Trip.com":
             st.session_state.update({
                 "active_url": trip_direct_url.strip(),
                 "active_destination": trip_dest_url.strip(),
+                "active_segment": "Hotel",
+                "active_source": ota_name,
                 "trigger_scrape": True,
             })
 
@@ -466,6 +764,8 @@ elif ota_name == "Mytour.vn":
             st.session_state.update({
                 "active_url": url,
                 "active_destination": mytour_dest.strip(),
+                "active_segment": "Hotel",
+                "active_source": ota_name,
                 "trigger_scrape": True,
                 "mytour_province_id": province_id_val,
                 "mytour_city_slug": slug,
@@ -510,6 +810,8 @@ elif ota_name == "Mytour.vn":
             st.session_state.update({
                 "active_url": mt_direct_url.strip(),
                 "active_destination": mt_dest_url.strip(),
+                "active_segment": "Hotel",
+                "active_source": ota_name,
                 "trigger_scrape": True,
                 "mytour_province_id": None,
                 "mytour_city_slug": "",
@@ -578,7 +880,13 @@ elif ota_name == "Travel.com.vn":
             tv_url = build_travel_url(city_slug=slug, city_id=cid, city_name=cname,
                                       check_in=ci_str, check_out=co_str,
                                       rooms=tv_rooms, adults=tv_adults, children=tv_children)
-            st.session_state.update({"active_url": tv_url, "active_destination": tv_dest.strip(), "trigger_scrape": True})
+            st.session_state.update({
+                "active_url": tv_url,
+                "active_destination": tv_dest.strip(),
+                "active_segment": "Hotel",
+                "active_source": ota_name,
+                "trigger_scrape": True,
+            })
 
     with tab_tv2:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
@@ -598,6 +906,8 @@ elif ota_name == "Travel.com.vn":
             st.session_state.update({
                 "active_url": tv_direct_url.strip(),
                 "active_destination": tv_dest_url.strip(),
+                "active_segment": "Hotel",
+                "active_source": ota_name,
                 "trigger_scrape": True,
             })
 
@@ -664,6 +974,8 @@ elif ota_name == "iVIVU":
             st.session_state.update({
                 "active_url": iv_suggest_url,
                 "active_destination": iv_dest_form.strip(),
+                "active_segment": "Hotel",
+                "active_source": ota_name,
                 "_iv_checkin": iv_checkin.strftime("%Y-%m-%d"),
                 "_iv_checkout": iv_checkout.strftime("%Y-%m-%d"),
                 "_iv_rooms": int(iv_rooms),
@@ -714,6 +1026,8 @@ elif ota_name == "iVIVU":
             st.session_state.update({
                 "active_url": iv_url.strip(),
                 "active_destination": iv_dest.strip(),
+                "active_segment": "Hotel",
+                "active_source": ota_name,
                 "_iv_checkin": iv_checkin_d.strftime("%Y-%m-%d"),
                 "_iv_checkout": iv_checkout_d.strftime("%Y-%m-%d"),
                 "_iv_rooms": int(iv_rooms_d),
@@ -732,21 +1046,45 @@ if st.session_state.get("trigger_scrape"):
 
     active_url = st.session_state.get("active_url", "")
     active_destination = st.session_state.get("active_destination", "")
+    active_segment = st.session_state.get("active_segment", segment_name)
+    active_source = st.session_state.get("active_source", ota_name)
 
     status_messages = []
     def update_status(msg: str):
         status_messages.append(msg)
 
-    with st.spinner(f"⏳  Đang kết nối và tải dữ liệu từ {ota_name}..."):
+    with st.spinner(f"⏳  Đang kết nối và tải dữ liệu từ {active_source}..."):
         try:
-            if ota_name == "Agoda":
-                results = run_scrape(url=active_url, destination=active_destination, status_callback=update_status)
-            elif ota_name == "Trip.com":
-                results = run_scrape_tripcom(url=active_url, destination=active_destination, status_callback=update_status)
-            elif ota_name == "Travel.com.vn":
-                results = run_scrape_travel(url=active_url, destination=active_destination, status_callback=update_status)
-            elif ota_name == "iVIVU":
-                results = run_scrape_ivivu(
+            if active_segment == "Tour":
+                if active_source == "FindTourGo":
+                    results = run_scrape_findtourgo_tours(
+                        url=active_url,
+                        country_code=st.session_state.get("_tour_country", ""),
+                        period_start=st.session_state.get("_tour_period_start", ""),
+                        period_end=st.session_state.get("_tour_period_end", ""),
+                        currency=st.session_state.get("_tour_currency", "USD"),
+                        locale="vi",
+                        status_callback=update_status,
+                    )
+                elif active_source == "Travel.com.vn":
+                    results = run_scrape_travel_tour(
+                        url=active_url,
+                        status_callback=update_status,
+                    )
+                else:
+                    raise ValueError(f"Nguồn tour chưa hỗ trợ: {active_source}")
+                st.session_state.scrape_results = results
+            elif active_source == "Agoda":
+                raw_results = run_scrape(url=active_url, destination=active_destination, status_callback=update_status)
+                st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)
+            elif active_source == "Trip.com":
+                raw_results = run_scrape_tripcom(url=active_url, destination=active_destination, status_callback=update_status)
+                st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)
+            elif active_source == "Travel.com.vn":
+                raw_results = run_scrape_travel(url=active_url, destination=active_destination, status_callback=update_status)
+                st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)
+            elif active_source == "iVIVU":
+                raw_results = run_scrape_ivivu(
                     url=active_url,
                     destination=active_destination,
                     check_in=st.session_state.get("_iv_checkin", ""),
@@ -756,6 +1094,7 @@ if st.session_state.get("trigger_scrape"):
                     children=st.session_state.get("_iv_children", 0),
                     status_callback=update_status,
                 )
+                st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)
             else:  # Mytour.vn
                 ci_str = st.session_state.get("check_in_str", "")
                 co_str = st.session_state.get("check_out_str", "")
@@ -766,8 +1105,7 @@ if st.session_state.get("trigger_scrape"):
                 mt_adults = st.session_state.get("_mt_adults", 2)
                 mt_children = st.session_state.get("_mt_children", 0)
                 if paste_mode or pid is None:
-                    # Paste mode: navigate to pasted URL, intercept all API responses
-                    results = run_scrape_mytour(
+                    raw_results = run_scrape_mytour(
                         url=active_url, destination=active_destination,
                         check_in=ci_str, check_out=co_str,
                         province_id=None, city_slug="",
@@ -775,14 +1113,15 @@ if st.session_state.get("trigger_scrape"):
                         status_callback=update_status,
                     )
                 else:
-                    results = run_scrape_mytour(
+                    raw_results = run_scrape_mytour(
                         url=active_url, destination=active_destination,
                         check_in=ci_str, check_out=co_str,
                         province_id=pid, city_slug=slug,
                         rooms=mt_rooms, adults=mt_adults, children=mt_children,
                         status_callback=update_status,
                     )
-            st.session_state.scrape_results = results
+                st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)
+            results = st.session_state.scrape_results
         except Exception as e:
             # Some exceptions stringify to an empty string; always show a useful message.
             err_text = str(e).strip() or f"{type(e).__name__}: {repr(e)}"
@@ -799,8 +1138,9 @@ if st.session_state.get("trigger_scrape"):
             for msg in status_messages:
                 st.markdown(f"<div style='font-family:monospace;font-size:.82rem;padding:3px 12px;border-left:3px solid #ccc;margin:2px 0;'>• {msg}</div>", unsafe_allow_html=True)
 
+    unit = "tour" if active_segment == "Tour" else "khách sạn"
     if results:
-        st.success(f"✅  Hoàn tất! Đã thu thập **{len(results)}** khách sạn từ {ota_name}.")
+        st.success(f"✅  Hoàn tất! Đã thu thập **{len(results)}** {unit} từ {active_source}.")
     else:
         st.warning(f"⚠️  Không tìm thấy dữ liệu. Hãy thử lại hoặc chọn điểm đến khác.")
 
@@ -809,6 +1149,18 @@ if st.session_state.scrape_results:
     results = st.session_state.scrape_results
     df = pd.DataFrame(results)
     active_destination = st.session_state.get("active_destination", "data")
+    active_segment = st.session_state.get("active_segment", segment_name)
+    active_source = st.session_state.get("active_source", ota_name)
+    if active_segment == "Hotel":
+        for col in HOTEL_RESULT_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[HOTEL_RESULT_COLUMNS]
+    else:
+        for col in TOUR_RESULT_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[TOUR_RESULT_COLUMNS]
 
     header_class = {
         "Agoda": "result-header-agoda",
@@ -816,106 +1168,114 @@ if st.session_state.scrape_results:
         "Mytour.vn": "result-header-mytour",
         "Travel.com.vn": "result-header-travel",
         "iVIVU": "result-header-ivivu",
-    }.get(ota_name, "result-header-agoda")
+        "FindTourGo": "result-header-tripcom",
+    }.get(active_source, "result-header-agoda")
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
     st.markdown(f"""
     <div class="result-header {header_class}">
-      <span style="font-size:1.5rem">{logo_map[ota_name]}</span>
-      <h3>{ota_name} · {active_destination}</h3>
-      <span class="result-badge">{len(df)} khách sạn</span>
+      <span style="font-size:1.5rem">{logo_map.get(active_source, '📦')}</span>
+      <h3>{active_source} · {active_destination}</h3>
+      <span class="result-badge">{len(df)} {'tour' if active_segment == 'Tour' else 'khách sạn'}</span>
     </div>
     """, unsafe_allow_html=True)
 
     # ── Metrics ──
-    price_col = {
-        "Agoda": "Giá/đêm (chưa gồm thuế)",
-        "Trip.com": "Giá/đêm (VND)",
-        "Mytour.vn": "Giá/đêm (VND)",
-        "Travel.com.vn": "Giá/đêm (VND)",
-        "iVIVU": "Giá/đêm (VND)",
-    }.get(ota_name, "Giá/đêm (VND)")
     m_cols = st.columns(5)
-    m_cols[0].metric("🏨 Tổng", len(df))
-    m_cols[1].metric("💰 Có giá", int(df[price_col].astype(bool).sum()) if price_col in df.columns else 0)
-    m_cols[2].metric("⭐ Có sao", int(df["Hạng sao"].astype(bool).sum()) if "Hạng sao" in df.columns else 0)
-    if ota_name == "Agoda":
-        m_cols[3].metric("🍳 Có bữa ăn", int(df["Gói bữa ăn"].astype(bool).sum()) if "Gói bữa ăn" in df.columns else 0)
-    elif ota_name in ("Mytour.vn", "Travel.com.vn", "iVIVU"):
-        m_cols[3].metric("📝 Số đánh giá", int(df["Số đánh giá"].astype(bool).sum()) if "Số đánh giá" in df.columns else 0)
+    if active_segment == "Tour":
+        m_cols[0].metric("🧭 Tổng tour", len(df))
+        m_cols[1].metric("📅 Có ngày khởi hành", int(df["Ngày khởi hành"].astype(bool).sum()))
+        m_cols[2].metric("💰 Có giá", int(df["Giá từ"].astype(bool).sum()))
+        m_cols[3].metric("🏢 Có hãng lữ hành", int(df["Công ty lữ hành"].astype(bool).sum()))
+        m_cols[4].metric("⭐ Có điểm đánh giá", int(df["Điểm đánh giá"].astype(bool).sum()))
     else:
-        m_cols[3].metric("🍳 Bữa ăn", "N/A")
-    m_cols[4].metric("🔓 Hủy miễn phí", int(df["Chính sách hoàn hủy"].str.contains("Hủy miễn phí", na=False).sum()) if "Chính sách hoàn hủy" in df.columns else 0)
+        m_cols[0].metric("🏨 Tổng", len(df))
+        m_cols[1].metric("💰 Có giá", int(df["Giá/đêm (VND)"].astype(bool).sum()))
+        m_cols[2].metric("⭐ Có sao", int(df["Hạng sao"].astype(bool).sum()))
+        m_cols[3].metric("🍳 Có bữa ăn", int(df["Gói bữa ăn"].astype(bool).sum()))
+        m_cols[4].metric("🔓 Hủy miễn phí", int(df["Chính sách hoàn hủy"].str.contains("Hủy miễn phí", na=False).sum()))
 
     # ── Filters ──
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
     st.markdown("#### 🔍  Tìm kiếm & Lọc")
-    fc1, fc2, fc3 = st.columns([2, 1, 1], gap="medium")
-    with fc1:
-        search_text = st.text_input("Tên khách sạn", placeholder="🔎  Nhập tên...", key="search_filter")
-    with fc2:
-        star_opts = ["Tất cả"] + sorted([s for s in df["Hạng sao"].dropna().unique() if s])
-        selected_star = st.selectbox("⭐  Hạng sao", star_opts, key="star_filter")
-    with fc3:
-        cancel_opts = ["Tất cả", "Hủy miễn phí", "Không hủy miễn phí"]
-        selected_cancel = st.selectbox("🔓  Chính sách hủy", cancel_opts, key="cancel_filter")
+    if active_segment == "Tour":
+        fc1, fc2, fc3 = st.columns([2, 1, 1], gap="medium")
+        with fc1:
+            search_text = st.text_input("Tên tour", placeholder="🔎  Nhập tên tour...", key="search_filter_tour")
+        with fc2:
+            has_departure = st.selectbox("📅 Khởi hành", ["Tất cả", "Có ngày khởi hành"], key="departure_filter")
+        with fc3:
+            min_days = st.number_input("⏱️ Số ngày tối thiểu", min_value=0, max_value=90, value=0, key="duration_filter")
 
-    fdf = df.copy()
-    if search_text:
-        fdf = fdf[fdf["Tên khách sạn"].str.contains(search_text, case=False, na=False)]
-    if selected_star != "Tất cả":
-        fdf = fdf[fdf["Hạng sao"] == selected_star]
-    if selected_cancel == "Hủy miễn phí":
-        fdf = fdf[fdf["Chính sách hoàn hủy"].str.contains("Hủy miễn phí", na=False)]
-    elif selected_cancel == "Không hủy miễn phí":
-        fdf = fdf[~fdf["Chính sách hoàn hủy"].str.contains("Hủy miễn phí", na=False)]
-    if len(fdf) < len(df):
-        st.caption(f"Hiển thị {len(fdf)} / {len(df)} khách sạn")
+        fdf = df.copy()
+        if search_text:
+            fdf = fdf[fdf["Tên tour"].str.contains(search_text, case=False, na=False)]
+        if has_departure == "Có ngày khởi hành":
+            fdf = fdf[fdf["Ngày khởi hành"].astype(bool)]
+        if min_days > 0:
+            duration_num = (
+                fdf["Thời lượng (ngày)"]
+                .astype(str)
+                .str.extract(r"(\d+)", expand=False)
+            )
+            fdf = fdf[pd.to_numeric(duration_num, errors="coerce").fillna(0) >= min_days]
+        if len(fdf) < len(df):
+            st.caption(f"Hiển thị {len(fdf)} / {len(df)} tour")
 
-    # ── Column config ──
-    col_cfg = {
-        "Tỉnh thành / Điểm đến": st.column_config.TextColumn("📍 Điểm đến", width="small"),
-        "Tên khách sạn": st.column_config.TextColumn("🏨 Tên khách sạn", width="large"),
-        "Hạng sao": st.column_config.TextColumn("⭐ Sao", width="small"),
-        "Điểm đánh giá": st.column_config.TextColumn("📊 Đánh giá", width="small"),
-        "Chính sách hoàn hủy": st.column_config.TextColumn("📋 Hủy", width="medium"),
-        "Link khách sạn": st.column_config.LinkColumn("🔗 Link", width="small"),
-    }
-    if ota_name == "Agoda":
-        col_cfg.update({
-            "Địa điểm nổi bật": st.column_config.TextColumn("🗺️ Landmark", width="large"),
-            "Gói bữa ăn": st.column_config.TextColumn("🍳 Bữa ăn", width="small"),
-            "Giá/đêm (chưa gồm thuế)": st.column_config.TextColumn("💰 Giá (chưa thuế)", width="medium"),
-            "Giá/đêm (đã gồm thuế)": st.column_config.TextColumn("💰 Giá (đã thuế)", width="medium"),
-        })
-    elif ota_name == "Trip.com":
-        col_cfg.update({
-            "Địa chỉ": st.column_config.TextColumn("📌 Địa điểm", width="medium"),
-            "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá/đêm (VND)", width="medium"),
-        })
-    elif ota_name == "Travel.com.vn":
-        col_cfg.update({
+        col_cfg = {
+            "Nguồn": st.column_config.TextColumn("🌐 Nguồn", width="small"),
+            "Quốc gia": st.column_config.TextColumn("🌍 Quốc gia", width="small"),
+            "Tên tour": st.column_config.TextColumn("🧭 Tên tour", width="large"),
+            "Mã tour": st.column_config.TextColumn("🔖 Mã", width="small"),
+            "Công ty lữ hành": st.column_config.TextColumn("🏢 Lữ hành", width="medium"),
+            "Thời lượng (ngày)": st.column_config.NumberColumn("⏱️ Ngày", width="small"),
+            "Giá từ": st.column_config.TextColumn("💰 Giá từ", width="small"),
+            "Tiền tệ": st.column_config.TextColumn("💱", width="small"),
+            "Điểm đánh giá": st.column_config.TextColumn("⭐ Đánh giá", width="small"),
+            "Điểm khởi hành": st.column_config.TextColumn("🧳 Khởi hành", width="small"),
+            "Phương tiện": st.column_config.TextColumn("✈️ Phương tiện", width="small"),
+            "Ngày khởi hành": st.column_config.TextColumn("📅 Ngày khởi hành", width="large"),
+            "Link tour": st.column_config.LinkColumn("🔗 Link tour", width="small"),
+        }
+    else:
+        fc1, fc2, fc3 = st.columns([2, 1, 1], gap="medium")
+        with fc1:
+            search_text = st.text_input("Tên khách sạn", placeholder="🔎  Nhập tên...", key="search_filter")
+        with fc2:
+            star_opts = ["Tất cả"] + sorted([s for s in df["Hạng sao"].dropna().unique() if s])
+            selected_star = st.selectbox("⭐  Hạng sao", star_opts, key="star_filter")
+        with fc3:
+            cancel_opts = ["Tất cả", "Hủy miễn phí", "Không hủy miễn phí"]
+            selected_cancel = st.selectbox("🔓  Chính sách hủy", cancel_opts, key="cancel_filter")
+
+        fdf = df.copy()
+        if search_text:
+            fdf = fdf[fdf["Tên khách sạn"].str.contains(search_text, case=False, na=False)]
+        if selected_star != "Tất cả":
+            fdf = fdf[fdf["Hạng sao"] == selected_star]
+        if selected_cancel == "Hủy miễn phí":
+            fdf = fdf[fdf["Chính sách hoàn hủy"].str.contains("Hủy miễn phí", na=False)]
+        elif selected_cancel == "Không hủy miễn phí":
+            fdf = fdf[~fdf["Chính sách hoàn hủy"].str.contains("Hủy miễn phí", na=False)]
+        if len(fdf) < len(df):
+            st.caption(f"Hiển thị {len(fdf)} / {len(df)} khách sạn")
+
+        col_cfg = {
+            "Nguồn": st.column_config.TextColumn("🌐 Nguồn", width="small"),
+            "Tỉnh thành / Điểm đến": st.column_config.TextColumn("📍 Điểm đến", width="small"),
+            "Tên khách sạn": st.column_config.TextColumn("🏨 Tên khách sạn", width="large"),
             "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ", width="large"),
-            "Số đánh giá": st.column_config.TextColumn("📝 Đánh giá", width="small"),
-            "Giá/đêm (chưa gồm thuế phí)": st.column_config.TextColumn("💸 Giá chưa thuế phí", width="medium"),
-            "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá đã gồm thuế phí", width="medium"),
+            "Hạng sao": st.column_config.TextColumn("⭐ Sao", width="small"),
+            "Điểm đánh giá": st.column_config.TextColumn("📊 Đánh giá", width="small"),
+            "Số đánh giá": st.column_config.TextColumn("📝 Số đánh giá", width="small"),
+            "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá/đêm (VND)", width="medium"),
+            "Giá/đêm (chưa gồm thuế)": st.column_config.TextColumn("💸 Chưa thuế", width="small"),
+            "Giá/đêm (đã gồm thuế)": st.column_config.TextColumn("💳 Đã gồm thuế", width="small"),
             "Thuế phí ước tính": st.column_config.TextColumn("🧾 Thuế phí", width="small"),
-            "Nguồn": st.column_config.TextColumn("🌐 Nguồn", width="small"),
-        })
-    elif ota_name == "iVIVU":
-        col_cfg.update({
-            "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ", width="large"),
-            "Số đánh giá": st.column_config.TextColumn("📝 Đánh giá", width="small"),
-            "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá/đêm (VND)", width="medium"),
-            "Nguồn": st.column_config.TextColumn("🌐 Nguồn", width="small"),
-        })
-    else:  # Mytour
-        col_cfg.update({
-            "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ đầy đủ", width="large"),
-            "Tỉnh/Thành": st.column_config.TextColumn("🏙️ Tỉnh/Thành", width="small"),
-            "Số đánh giá": st.column_config.TextColumn("📝 Đánh giá", width="small"),
-            "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá/đêm (VND)", width="medium"),
-        })
+            "Gói bữa ăn": st.column_config.TextColumn("🍳 Bữa ăn", width="small"),
+            "Chính sách hoàn hủy": st.column_config.TextColumn("📋 Hủy", width="medium"),
+            "Link khách sạn": st.column_config.LinkColumn("🔗 Link", width="small"),
+        }
 
     st.dataframe(fdf, use_container_width=True, height=480, column_config=col_cfg)
 
@@ -926,7 +1286,7 @@ if st.session_state.scrape_results:
 
     with dl1:
         out = io.BytesIO()
-        sheet = f"{ota_name} - {active_destination}"[:31]
+        sheet = f"{active_source} - {active_destination}"[:31]
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name=sheet)
             ws = writer.sheets[sheet]
@@ -937,7 +1297,7 @@ if st.session_state.scrape_results:
         out.seek(0)
         st.download_button(
             label="📊  Tải Excel (.xlsx)", data=out.getvalue(),
-            file_name=f"{ota_name}_{active_destination}.xlsx",
+            file_name=f"{active_source}_{active_destination}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True, type="primary"
         )
@@ -945,7 +1305,7 @@ if st.session_state.scrape_results:
         csv_data = df.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
             label="📄  Tải CSV (.csv)", data=csv_data.encode("utf-8-sig"),
-            file_name=f"{ota_name}_{active_destination}.csv",
+            file_name=f"{active_source}_{active_destination}.csv",
             mime="text/csv", use_container_width=True
         )
     with dl3:
