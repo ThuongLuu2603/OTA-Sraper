@@ -17,7 +17,7 @@ st.set_page_config(
     page_title="OTA Hotel Scraper",
     page_icon="🏨",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 
@@ -119,8 +119,49 @@ st.markdown("""
 /* ── Global ── */
 [data-testid="stAppViewContainer"] { background: #F0F4F8; }
 [data-testid="stHeader"] { background: transparent; }
-[data-testid="stToolbar"] { display: none; }
+/* Keep toolbar visible so sidebar toggle always remains accessible. */
+[data-testid="stToolbar"] { display: block; }
+[data-testid="stSidebarCollapsedControl"] { display: flex !important; visibility: visible !important; }
 .block-container { padding-top: 0 !important; max-width: 1200px; }
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #F7FAFC 0%, #EEF3F9 100%);
+    border-right: 1px solid #E2E8F0;
+}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3 {
+    color: #1F2937;
+    font-size: 1rem;
+    font-weight: 800;
+    margin-bottom: .2rem;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] {
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    padding: 0;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] > div {
+    flex-direction: column !important;
+    gap: 8px;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label {
+    background: #FFFFFF;
+    border: 1.5px solid #DCE5F1 !important;
+    border-radius: 12px !important;
+    padding: .55rem .75rem !important;
+    font-weight: 700 !important;
+    font-size: .9rem !important;
+    box-shadow: 0 1px 6px rgba(15,23,42,.05);
+}
+[data-testid="stSidebar"] [data-baseweb="radio"] label:has(input:checked) {
+    border-color: #4F46E5 !important;
+    background: #EEF2FF;
+    box-shadow: 0 2px 10px rgba(79,70,229,.22);
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
+    border-color: #A5B4FC !important;
+}
 
 /* ── Hero ── */
 .hero {
@@ -294,33 +335,32 @@ today = date.today()
 # ── Segment + source selector ───────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Bộ chọn dữ liệu")
+    st.caption("Chọn phân khúc và nguồn scrape")
     segment = st.radio(
         "Chọn phân khúc",
         ["🏨 Hotel", "🧭 Tour"],
         horizontal=False,
         key="segment_radio",
     )
-segment_name = segment.split(" ", 1)[1]
-
-if segment_name == "Hotel":
-    with st.sidebar:
+    segment_name = segment.split(" ", 1)[1]
+    st.markdown("---")
+    if segment_name == "Hotel":
         ota = st.radio(
             "Chọn OTA Hotel",
             ["🟠 Agoda", "🔵 Trip.com", "🟢 Mytour.vn", "🟣 Travel.com.vn", "🟡 iVIVU"],
             horizontal=False,
             key="ota_radio",
         )
-    ota_name = ota.split(" ", 1)[1]
-else:
-    with st.sidebar:
+        ota_name = ota.split(" ", 1)[1]
+    else:
         tour_source = st.radio(
             "Chọn nguồn Tour",
             ["🧭 FindTourGo", "🟣 Travel.com.vn"],
             horizontal=False,
             key="tour_source_radio",
         )
-    ota = tour_source
-    ota_name = tour_source.split(" ", 1)[1]
+        ota = tour_source
+        ota_name = tour_source.split(" ", 1)[1]
 
 # Clear results if selector changed
 selector_key = f"{segment_name}:{ota_name}"
