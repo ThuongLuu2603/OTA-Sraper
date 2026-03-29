@@ -388,41 +388,38 @@ async def _detect_total_hotels(page) -> int:
 
 def _clean_tripcom_url(raw_url: str) -> str:
     """
-    Strip marketing/filter/UI params from a Trip.com URL and rebuild a clean
-    scraper-friendly URL that renders the standard hotel list page.
-    Keeps: city/cityId, provinceId/districtId, countryId, checkin/checkout,
-           adult/children/crn, searchType, searchWord, searchValue, curr/locale.
-    Removes: listFilters, flexType, fixedDate, old, ctm_ref, searchBoxArg,
-             travelPurpose, domestic, searchCoordinate, lat/lon, etc.
+    Keep Trip.com URL mostly intact to preserve server-side search context.
+    Earlier aggressive cleanup removed key params and reduced reachable inventory.
+    We only normalize currency/locale and drop obvious tracking params.
     """
     from urllib.parse import urlparse, parse_qs, urlencode
 
-    KEEP_PARAMS = {
-        "city", "cityid", "cityname",
-        "provinceid", "districtid", "countryid",
-        "checkin", "checkout", "checkIn", "checkOut",
-        "adult", "adults", "children", "crn", "rooms",
-        "searchtype", "searchword", "searchvalue",
-        "searchname", "destname",
-        "curr", "barcurr", "locale",
+    DROP_PARAMS = {
+        "ctm_ref", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "analyticsSessionId", "correlationId",
     }
 
     try:
         parsed = urlparse(raw_url)
         params = parse_qs(parsed.query, keep_blank_values=False)
-        clean = {k: v for k, v in params.items() if k.lower() in KEEP_PARAMS}
-        # Ensure VND currency
-        if "curr" not in clean and "barCurr" not in clean:
-            clean["curr"] = ["VND"]
-        if "locale" not in clean:
-            clean["locale"] = ["vi-VN"]
-        new_query = urlencode({k: v[0] for k, v in clean.items()})
+        clean = {k: v for k, v in params.items() if k not in DROP_PARAMS}
+        # Ensure stable VN defaults
+        clean["curr"] = [clean.get("curr", clean.get("barCurr", ["VND"]))[0]]
+        clean["locale"] = [clean.get("locale", ["vi-VN"])[0]]
+        new_query = urlencode({k: v[0] for k, v in clean.items()}, doseq=True)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
     except Exception:
         return raw_url
 
 
-async def _scroll_and_extract(page, destination: str, status_callback, page_label: str = "") -> list[dict]:
+async def _scroll_and_extract(
+    page,
+    destination: str,
+    status_callback,
+    page_label: str = "",
+    max_rounds: int = 16,
+    no_growth_limit: int = 8,
+) -> list[dict]:
     """
     Scroll through the full page to ensure all content is rendered,
     then extract all hotel cards in a single pass.
@@ -431,9 +428,9 @@ async def _scroll_and_extract(page, destination: str, status_callback, page_labe
     """
     # Scroll and collect incrementally to survive virtualized lists.
     raw_map: dict[str, dict] = {}
-    prev_h = 0
-    stable_rounds = 0
-    for i in range(16):
+    no_growth_rounds = 0
+    for i in range(max_rounds):
+        before_count = len(raw_map)
         payload = await page.evaluate(HOTEL_CARD_JS)
         if isinstance(payload, dict):
             raw = payload.get("results", []) or []
@@ -443,7 +440,7 @@ async def _scroll_and_extract(page, destination: str, status_callback, page_labe
                 key = (r.get("hotelId") or r.get("link") or r.get("name") or "").strip()
                 if key and key not in raw_map:
                     raw_map[key] = r
-            if i in (0, 1, 2, 5, 10, 15):
+            if i in (0, 1, 2, 5, 10, 15) or ((i + 1) % 20 == 0):
                 status_callback(
                     f"  🔍 {page_label}selector='{sel}' round={i + 1} visible={len(raw)} collected={len(raw_map)}"
                 )
@@ -454,17 +451,13 @@ async def _scroll_and_extract(page, destination: str, status_callback, page_labe
                 if key and key not in raw_map:
                     raw_map[key] = r
 
-        h = await page.evaluate("document.body.scrollHeight")
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(0.8)
-        new_h = await page.evaluate("document.body.scrollHeight")
-
-        if new_h <= prev_h:
-            stable_rounds += 1
+        await asyncio.sleep(0.6)
+        if len(raw_map) > before_count:
+            no_growth_rounds = 0
         else:
-            stable_rounds = 0
-        prev_h = new_h
-        if stable_rounds >= 3:
+            no_growth_rounds += 1
+        if no_growth_rounds >= no_growth_limit and i >= 6:
             break
         if i >= 5 and len(raw_map) == 0:
             # Nothing detected after multiple scroll rounds => stop early.
@@ -749,13 +742,25 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
             status_callback(f"📊 Trip.com: tổng ~{total_hotels} khách sạn")
 
         # Extract page 1 from DOM (always reliable for first page)
-        p1_hotels = await _scroll_and_extract(page, destination, status_callback, "p1 ")
+        p1_hotels = await _scroll_and_extract(
+            page, destination, status_callback, "p1 ", max_rounds=24, no_growth_limit=6
+        )
         _add_new(p1_hotels, results, seen_keys)
         status_callback(f"📄 Trang 1: {len(p1_hotels)} khách sạn — Tổng: {len(results)}")
 
         # Wait a bit for API interception to capture
         if not api_cap.get("ready"):
             await asyncio.sleep(3)
+
+        # If API cannot be captured and page appears to be infinite-load,
+        # aggressively scroll the first page to pull in more hotels.
+        if not api_cap.get("ready") and len(results) < 250:
+            status_callback("🔁 Không bắt được API ổn định, chuyển sang deep-scroll trang 1...")
+            deep_hotels = await _scroll_and_extract(
+                page, destination, status_callback, "p1-deep ", max_rounds=220, no_growth_limit=14
+            )
+            deep_added = _add_new(deep_hotels, results, seen_keys)
+            status_callback(f"  → Deep-scroll: +{deep_added} mới (tổng: {len(results)})")
 
         # Update total from API response (more reliable than DOM)
         if api_cap.get("api_total", 0) > total_hotels:
