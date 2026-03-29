@@ -11,7 +11,7 @@ from scraper_tripcom import build_tripcom_url, resolve_trip_city, run_scrape_tri
 from scraper_mytour import build_mytour_url, resolve_mytour_city, run_scrape_mytour
 from scraper_travelcomvn import build_travel_url, resolve_travel_city, run_scrape_travel
 from scraper_ivivu import run_scrape_ivivu, resolve_ivivu_region_url
-from scraper_findtourgo import build_findtourgo_url, run_scrape_findtourgo_tours
+from scraper_findtourgo import build_findtourgo_url, normalize_findtourgo_departure_display, run_scrape_findtourgo_tours
 from scraper_travelcomvn_tour import build_travel_tour_url, resolve_travel_tour_slug, run_scrape_travel_tour
 from market_db import (
     db_ready,
@@ -1736,6 +1736,17 @@ if (not compare_tool_mode) and st.session_state.scrape_results:
             if col not in df.columns:
                 df[col] = ""
         df = df[TOUR_RESULT_COLUMNS]
+        if active_source == "FindTourGo" and "Ngày khởi hành" in df.columns:
+
+            def _fmt_ftg_departure(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return ""
+                s = str(v).strip()
+                if not s or s.lower() == "nan":
+                    return ""
+                return normalize_findtourgo_departure_display(s)
+
+            df["Ngày khởi hành"] = df["Ngày khởi hành"].apply(_fmt_ftg_departure)
 
     header_class = {
         "Agoda": "result-header-agoda",

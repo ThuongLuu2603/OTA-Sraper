@@ -32,6 +32,41 @@ def _fmt_money(v):
         return ""
 
 
+def _pick_display_price(item: dict, want_currency: str) -> tuple[float | None, str]:
+    """
+    Giá ở cấp item thường theo item['currency'] (USD hoặc VND tùy nhà điều hành).
+    Để khớp filter currency= trên URL, lấy đúng phần tử trong item['prices'].
+    """
+    want = _safe_text(want_currency).upper() or "USD"
+
+    for p in item.get("prices") or []:
+        if not isinstance(p, dict):
+            continue
+        if _safe_text(p.get("currency")).upper() != want:
+            continue
+        sale = p.get("salePrice")
+        reg = p.get("regularPrice")
+        try:
+            if sale is not None and float(sale) > 0:
+                return float(sale), want
+            if reg is not None and float(reg) > 0:
+                return float(reg), want
+        except (TypeError, ValueError):
+            pass
+
+    native = _safe_text(item.get("currency")).upper() or want
+    sale_price = item.get("salePrice")
+    regular_price = item.get("regularPrice")
+    try:
+        if sale_price is not None and float(sale_price) > 0:
+            return float(sale_price), native
+        if regular_price is not None and float(regular_price) > 0:
+            return float(regular_price), native
+    except (TypeError, ValueError):
+        pass
+    return None, want
+
+
 def _build_public_tour_url(locale: str, tour_code: str, slug: str) -> str:
     locale = _safe_text(locale, "vi") or "vi"
     tour_code = _safe_text(tour_code)
@@ -43,35 +78,132 @@ def _build_public_tour_url(locale: str, tour_code: str, slug: str) -> str:
     return f"{BASE_SITE}/{locale}/tours/{tour_code}"
 
 
+_WEEKDAY_VI = {
+    "monday": "Thứ 2",
+    "tuesday": "Thứ 3",
+    "wednesday": "Thứ 4",
+    "thursday": "Thứ 5",
+    "friday": "Thứ 6",
+    "saturday": "Thứ 7",
+    "sunday": "CN",
+}
+
+
+def _iso_to_ddmmyyyy(iso_s: str) -> str:
+    """Chuẩn hóa ISO API (UTC) sang dd/mm/yyyy để không hiển thị raw timestamp."""
+    s = _safe_text(iso_s)
+    if not s:
+        return ""
+    try:
+        if "T" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+    return s
+
+
+def _weekdays_vi(weekdays: list) -> str:
+    parts = []
+    for x in weekdays or []:
+        k = _safe_text(x).lower()
+        if not k:
+            continue
+        parts.append(_WEEKDAY_VI.get(k, k))
+    return ", ".join(parts)
+
+
+def _departure_range_label(start_iso: str, end_iso: str) -> str:
+    a = _iso_to_ddmmyyyy(start_iso)
+    b = _iso_to_ddmmyyyy(end_iso)
+    if a and b:
+        return f"{a} – {b}"
+    return " – ".join([x for x in [a, b] if x])
+
+
+def _extract_one_schedule_departure(sch: dict) -> str:
+    """Một dòng mô tả lịch khởi hành cho một tourSchedules entry."""
+    if not isinstance(sch, dict):
+        return ""
+    spec = [_safe_text(x) for x in (sch.get("departureSpecifiedDates") or []) if _safe_text(x)]
+    if spec:
+        return ", ".join(spec)
+
+    dtype = _safe_text(sch.get("departureType")).upper()
+    start_date = sch.get("startDate")
+    end_date = sch.get("endDate")
+    range_txt = _departure_range_label(start_date or "", end_date or "")
+    wd_vi = _weekdays_vi(sch.get("departureWeekdays") or [])
+
+    # DAILY: khoảng ngày là “có tour mỗi ngày”, không phải 2 ngày khởi hành cố định.
+    if dtype == "DAILY":
+        if range_txt:
+            return f"Hằng ngày ({range_txt})"
+        return "Hằng ngày"
+
+    if dtype == "RECURRING_WEEKDAYS" and wd_vi:
+        if range_txt:
+            return f"Theo thứ: {wd_vi} ({range_txt})"
+        return f"Theo thứ: {wd_vi}"
+
+    if wd_vi:
+        if range_txt:
+            return f"Theo thứ: {wd_vi} ({range_txt})"
+        return f"Theo thứ: {wd_vi}"
+
+    if range_txt:
+        return range_txt
+
+    return ""
+
+
 def _extract_departure_dates(detail_json: dict) -> str:
     schedules = detail_json.get("tourSchedules") or []
-    dates = []
+    pieces: list[str] = []
     for sch in schedules:
-        if not isinstance(sch, dict):
-            continue
-        for d in sch.get("departureSpecifiedDates") or []:
-            txt = _safe_text(d)
-            if txt:
-                dates.append(txt)
-        # Keep extra schedule hints if explicit dates are empty.
-        if not dates:
-            start_date = _safe_text(sch.get("startDate"))
-            end_date = _safe_text(sch.get("endDate"))
-            if start_date or end_date:
-                dates.append(" - ".join([x for x in [start_date, end_date] if x]))
-            weekdays = sch.get("departureWeekdays") or []
-            if weekdays:
-                wd_text = ", ".join([_safe_text(x) for x in weekdays if _safe_text(x)])
-                if wd_text:
-                    dates.append(f"Theo thứ: {wd_text}")
-    # Deduplicate while preserving order.
-    seen = set()
-    ordered = []
-    for d in dates:
-        if d not in seen:
-            seen.add(d)
-            ordered.append(d)
+        seg = _extract_one_schedule_departure(sch)
+        if seg:
+            pieces.append(seg)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for p in pieces:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
     return " | ".join(ordered)
+
+
+_ISO_TIMESTAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:\d{2})"
+)
+
+
+def normalize_findtourgo_departure_display(text: str) -> str:
+    """
+    Đưa cột Ngày khởi hành về dạng đọc được: thay mọi timestamp ISO trong chuỗi
+    (kể cả dữ liệu scrape cũ / nạp từ DB) sang dd/mm/yyyy; dịch thứ tiếng Anh còn sót.
+    """
+    t = _safe_text(text)
+    if not t or t.lower() == "nan":
+        return ""
+
+    def iso_sub(m: re.Match) -> str:
+        return _iso_to_ddmmyyyy(m.group(0))
+
+    out = _ISO_TIMESTAMP_RE.sub(iso_sub, t)
+    out = re.sub(r"(\d{2}/\d{2}/\d{4})\s+-\s+(\d{2}/\d{2}/\d{4})", r"\1 – \2", out)
+
+    def wd_sub(m: re.Match) -> str:
+        k = m.group(1).lower()
+        return _WEEKDAY_VI.get(k, m.group(0))
+
+    out = re.sub(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        wd_sub,
+        out,
+        flags=re.I,
+    )
+    return out
 
 
 def _parse_country_and_dates(url: str):
@@ -233,9 +365,7 @@ def run_scrape_findtourgo_tours(
                 departure_text = ""
 
             agency = item.get("travelAgency") or {}
-            sale_price = item.get("salePrice")
-            regular_price = item.get("regularPrice")
-            price_val = sale_price if sale_price and float(sale_price) > 0 else regular_price
+            price_val, price_ccy = _pick_display_price(item, currency)
             stars = item.get("score")
             score = item.get("ratingScore")
 
@@ -249,7 +379,7 @@ def run_scrape_findtourgo_tours(
                     "Công ty lữ hành": _safe_text(agency.get("name")),
                     "Thời lượng (ngày)": _to_int(item.get("duration"), 0),
                     "Giá từ": _fmt_money(price_val),
-                    "Tiền tệ": _safe_text(currency, "USD"),
+                    "Tiền tệ": price_ccy,
                     "Điểm đánh giá": _safe_text(score),
                     "Xếp hạng nội bộ": _safe_text(stars),
                     "Ngày khởi hành": departure_text,
