@@ -1,9 +1,11 @@
 import json
 import os
+import socket
 import unicodedata
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -67,6 +69,54 @@ def _normalize_database_url(url: str) -> str:
     return u
 
 
+def _ipv4_hostaddr(hostname: str) -> str | None:
+    """IPv4 để tránh lỗi IPv6 trên một số môi trường (vd. Streamlit Cloud)."""
+    if not hostname:
+        return None
+    try:
+        infos = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+        if infos:
+            return infos[0][4][0]
+    except OSError:
+        pass
+    return None
+
+
+def _supabase_direct_db_host(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    h = hostname.lower()
+    return h.endswith(".supabase.co") and h.startswith("db.")
+
+
+def _connect_kw_from_database_url_ipv4(dsn: str, timeout: int) -> dict[str, Any] | None:
+    """Dùng host + hostaddr (IPv4) cho URI trỏ tới db.*.supabase.co."""
+    u = urlparse(_normalize_database_url(dsn))
+    hn = u.hostname
+    if not _supabase_direct_db_host(hn or ""):
+        return None
+    v4 = _ipv4_hostaddr(hn or "")
+    if not v4:
+        return None
+    qs = parse_qs(u.query)
+    sslmode = (qs.get("sslmode") or ["require"])[0]
+    user = unquote(u.username or "")
+    password = unquote(u.password or "")
+    dbname = (u.path or "/postgres").strip("/") or "postgres"
+    port = u.port or 5432
+    return {
+        "host": hn,
+        "hostaddr": v4,
+        "port": port,
+        "dbname": dbname,
+        "user": user,
+        "password": password,
+        "sslmode": sslmode,
+        "connect_timeout": timeout,
+        "cursor_factory": RealDictCursor,
+    }
+
+
 def db_ready() -> tuple[bool, str]:
     cfg = _db_config()
     if cfg["database_url"]:
@@ -89,17 +139,25 @@ def get_conn():
         timeout = 15
     if cfg["database_url"]:
         dsn = _normalize_database_url(cfg["database_url"])
+        kw_url = _connect_kw_from_database_url_ipv4(dsn, timeout)
+        if kw_url:
+            return psycopg2.connect(**kw_url)
         return psycopg2.connect(dsn, cursor_factory=RealDictCursor, connect_timeout=timeout)
-    return psycopg2.connect(
-        host=cfg["host"],
-        port=int(cfg["port"]),
-        dbname=cfg["dbname"],
-        user=cfg["user"],
-        password=cfg["password"],
-        sslmode=cfg["sslmode"],
-        connect_timeout=timeout,
-        cursor_factory=RealDictCursor,
-    )
+    kw: dict[str, Any] = {
+        "host": cfg["host"],
+        "port": int(cfg["port"]),
+        "dbname": cfg["dbname"],
+        "user": cfg["user"],
+        "password": cfg["password"],
+        "sslmode": cfg["sslmode"],
+        "connect_timeout": timeout,
+        "cursor_factory": RealDictCursor,
+    }
+    if _supabase_direct_db_host(cfg["host"]):
+        v4 = _ipv4_hostaddr(cfg["host"])
+        if v4:
+            kw["hostaddr"] = v4
+    return psycopg2.connect(**kw)
 
 
 def init_db() -> tuple[bool, str]:
