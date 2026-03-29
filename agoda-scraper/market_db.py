@@ -87,7 +87,9 @@ def _ipv4_hostaddr(hostname: str) -> str | None:
     return None
 
 
-# Transaction pooler host = aws-0-<region>.pooler.supabase.com :6543, user postgres.<project_ref>
+# Pooler host thường là aws-0-<region> hoặc aws-1-<region> (tùy project Supabase).
+_POOLER_AWS_PREFIXES: tuple[str, ...] = ("aws-0", "aws-1")
+
 _COMMON_POOLER_REGIONS: tuple[str, ...] = (
     "ap-southeast-1",
     "ap-southeast-2",
@@ -118,7 +120,9 @@ def _build_pooler_dsn_from_direct(
     if (u.port or 5432) != 5432:
         return None
     ref = m.group(1)
-    host_out = pooler_host or f"aws-0-{region}.pooler.supabase.com"
+    host_out = pooler_host or (f"aws-0-{region}.pooler.supabase.com" if region else "")
+    if not host_out:
+        return None
     user_plain = unquote(u.username or "postgres")
     pooler_user = f"postgres.{ref}" if user_plain == "postgres" else user_plain
     pwd_plain = unquote(u.password or "")
@@ -149,13 +153,19 @@ def _direct_supabase_pooler_candidates(dsn: str) -> list[str]:
             seen.add(b)
             out.append(b)
 
-    push(user_region or None, user_host or None)
+    def push_region(r: str) -> None:
+        for prefix in _POOLER_AWS_PREFIXES:
+            push(r, f"{prefix}-{r}.pooler.supabase.com")
+
     if user_host:
+        push(user_region or None, user_host)
         return out
+    if user_region:
+        push_region(user_region)
     for r in _COMMON_POOLER_REGIONS:
         if r == user_region:
             continue
-        push(r, None)
+        push_region(r)
     return out
 
 
