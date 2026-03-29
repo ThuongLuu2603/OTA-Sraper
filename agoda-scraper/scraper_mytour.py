@@ -14,6 +14,7 @@ Province ID mapping was discovered by probing the tripi.vn API.
 import asyncio
 import re
 import shutil
+import sys
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ---------------------------------------------------------------------------
@@ -146,6 +147,15 @@ AVAILABILITY_URL = "https://apis.tripi.vn/hotels/v3/hotels/availability"
 PAGE_SIZE = 20  # items per page
 
 
+def _ensure_windows_proactor_policy() -> None:
+    """
+    Playwright requires subprocess support; force Proactor loop policy on Windows.
+    Some hosts set Selector policy, which raises NotImplementedError for subprocess.
+    """
+    if sys.platform.startswith("win") and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+
 def get_chromium_path():
     for name in ["chromium-browser", "chromium", "google-chrome"]:
         p = shutil.which(name)
@@ -246,16 +256,19 @@ async def _scrape_async(province_id: int, destination: str,
                         status_callback) -> list[dict]:
     chromium = get_chromium_path()
     if not chromium:
-        raise RuntimeError("Không tìm thấy Chromium.")
+        status_callback("ℹ️ Không thấy Chromium hệ thống, dùng Chromium của Playwright.")
 
     results: list[dict] = []
     seen_ids: set = set()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True, executable_path=chromium,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        }
+        if chromium:
+            launch_kwargs["executable_path"] = chromium
+        browser = await pw.chromium.launch(**launch_kwargs)
         ctx = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1366, "height": 768},
@@ -409,7 +422,7 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
 
     chromium = get_chromium_path()
     if not chromium:
-        raise RuntimeError("Không tìm thấy Chromium.")
+        status_callback("ℹ️ Không thấy Chromium hệ thống, dùng Chromium của Playwright.")
 
     # Parse guest params + dates from the pasted URL
     try:
@@ -432,10 +445,13 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
     discovered: dict = {}  # apphash, province_id, total
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True, executable_path=chromium,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        }
+        if chromium:
+            launch_kwargs["executable_path"] = chromium
+        browser = await pw.chromium.launch(**launch_kwargs)
         ctx = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1366, "height": 768},
@@ -444,10 +460,21 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
         page = await ctx.new_page()
 
         async def on_request(request):
-            if "apis.tripi.vn" in request.url and "apphash" not in discovered:
+            if "apis.tripi.vn" in request.url:
                 h = request.headers
-                if h.get("apphash"):
+                if h.get("apphash") and "apphash" not in discovered:
                     discovered["apphash"] = h["apphash"]
+                # More robust than response parsing: provinceId often exists in request body.
+                if "province_id" not in discovered:
+                    try:
+                        body = request.post_data or ""
+                        if body:
+                            payload = _json.loads(body)
+                            pid = payload.get("provinceId") or payload.get("province_id")
+                            if pid:
+                                discovered["province_id"] = int(pid)
+                    except Exception:
+                        pass
 
         async def on_response(response):
             if AVAILABILITY_URL in response.url and response.status == 200 and "province_id" not in discovered:
@@ -482,7 +509,7 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
         total_hint = discovered.get("total", 0)
 
         if not province_id:
-            status_callback("❌ Không phát hiện được province_id từ URL này. Thử dùng tab cấu hình với tên tỉnh cụ thể.")
+            status_callback("❌ Không phát hiện được province_id từ URL này. Hãy refresh trang và thử lại, hoặc dùng tab cấu hình.")
             await browser.close()
             return []
 
@@ -601,6 +628,7 @@ def run_scrape_mytour(url: str, destination: str, check_in: str, check_out: str,
     """
     if status_callback is None:
         status_callback = print
+    _ensure_windows_proactor_policy()
 
     if province_id is not None:
         return asyncio.run(_scrape_async(

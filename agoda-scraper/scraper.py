@@ -4,6 +4,7 @@ import re
 import shutil
 import urllib.request
 import json
+import sys
 from datetime import datetime
 from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -28,6 +29,15 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
 ]
+
+
+def _ensure_windows_proactor_policy() -> None:
+    """
+    Playwright requires subprocess support; force Proactor loop policy on Windows.
+    Some hosts set Selector policy, which raises NotImplementedError for subprocess.
+    """
+    if sys.platform.startswith("win") and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 # ---------------------------------------------------------------------------
@@ -458,4 +468,5 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
 
 def run_scrape(url: str, destination: str, status_callback=None) -> list:
     """Synchronous wrapper."""
+    _ensure_windows_proactor_policy()
     return asyncio.run(scrape_agoda(url, destination, status_callback))

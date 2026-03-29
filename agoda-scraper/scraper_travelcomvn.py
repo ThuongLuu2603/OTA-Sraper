@@ -17,6 +17,7 @@ import json
 import re
 import shutil
 import time
+import sys
 from urllib.parse import urlparse, parse_qs, quote
 
 import requests as _requests
@@ -83,6 +84,18 @@ CITY_MAP: dict[str, tuple[str, int, str]] = {
 
 API_URL = "https://api2.travel.com.vn/core/Hotel/search-hotel"
 PAGE_SIZE = 20
+# Travel.com.vn list API does not expose explicit tax/fee fields.
+# Use a configurable estimate for gross price to align with "đã gồm thuế phí" display.
+TRAVEL_TAX_FEE_RATE = 0.15
+
+
+def _ensure_windows_proactor_policy() -> None:
+    """
+    Playwright requires subprocess support; force Proactor loop policy on Windows.
+    Some hosts set Selector policy, which raises NotImplementedError for subprocess.
+    """
+    if sys.platform.startswith("win") and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 def resolve_travel_city(destination: str) -> tuple[str, int, str] | None:
@@ -185,6 +198,16 @@ def _fmt_vnd(price) -> str:
         return str(price)
 
 
+def _price_with_tax_fee(price):
+    try:
+        v = float(price)
+        if v <= 0:
+            return None
+        return round(v * (1 + TRAVEL_TAX_FEE_RATE))
+    except Exception:
+        return None
+
+
 def _fmt_stars(rating) -> str:
     if rating is None:
         return ""
@@ -223,6 +246,8 @@ def _hotel_url(hotel: dict, city_slug: str = "") -> str:
 
 
 def _parse_hotel(hotel: dict, destination: str, city_slug: str) -> dict:
+    base_price = hotel.get("price")
+    gross_price = _price_with_tax_fee(base_price)
     return {
         "Tên khách sạn": hotel.get("hotelName", ""),
         "Link khách sạn": _hotel_url(hotel, city_slug),
@@ -231,7 +256,9 @@ def _parse_hotel(hotel: dict, destination: str, city_slug: str) -> dict:
         "Loại": hotel.get("typeTitle", ""),
         "Điểm đánh giá": _fmt_score(hotel.get("reviewScore")),
         "Số đánh giá": str(int(hotel.get("reviewCount") or 0)) if hotel.get("reviewCount") else "",
-        "Giá/đêm (VND)": _fmt_vnd(hotel.get("price")),
+        "Giá/đêm (chưa gồm thuế phí)": _fmt_vnd(base_price),
+        "Giá/đêm (VND)": _fmt_vnd(gross_price if gross_price is not None else base_price),
+        "Thuế phí ước tính": f"{int(TRAVEL_TAX_FEE_RATE * 100)}%",
         "Chính sách hoàn hủy": "",
         "Nguồn": "travel.com.vn",
         "Điểm đến": destination,
@@ -242,7 +269,7 @@ def _parse_hotel(hotel: dict, destination: str, city_slug: str) -> dict:
 # JWT capture via Playwright (one-time page load)
 # ---------------------------------------------------------------------------
 
-async def _capture_jwt(url: str, chromium: str, status_callback) -> tuple[str, str, dict] | None:
+async def _capture_jwt(url: str, chromium: str | None, status_callback) -> tuple[str, str, dict] | None:
     """
     Open the search URL once, capture:
       - JWT token from Authorization header
@@ -250,67 +277,77 @@ async def _capture_jwt(url: str, chromium: str, status_callback) -> tuple[str, s
       - First API response (to save a round-trip)
     Returns (jwt, client_id, first_response_json) or None on failure.
     """
-    captured: dict = {}
+    # Some launch args can crash Chromium on Windows. Try stable profiles in order.
+    launch_profiles = [
+        ["--disable-blink-features=AutomationControlled"],
+        ["--disable-gpu", "--disable-blink-features=AutomationControlled"],
+    ]
+    if not sys.platform.startswith("win"):
+        launch_profiles.append([
+            "--no-sandbox", "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ])
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            executable_path=chromium,
-            args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage", "--disable-gpu",
-                "--single-process", "--no-zygote",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        ctx = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 768},
-            locale="vi-VN",
-            extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9"},
-        )
-        page = await ctx.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
+    for attempt, launch_args in enumerate(launch_profiles, start=1):
+        captured: dict = {}
+        async with async_playwright() as pw:
+            launch_kwargs = {"headless": True, "args": launch_args}
+            if chromium:
+                launch_kwargs["executable_path"] = chromium
 
-        async def on_response(resp):
-            if "search-hotel" in resp.url and "jwt" not in captured:
-                h = dict(resp.request.headers)
-                captured["jwt"] = h.get("authorization", "")
-                captured["client_id"] = h.get("clientid", "")
-                captured["req_body"] = resp.request.post_data or ""
-                try:
-                    captured["resp_json"] = await resp.json()
-                except Exception:
-                    pass
-
-        page.on("response", on_response)
-
-        status_callback("🌐 Đang mở travel.com.vn để lấy token xác thực...")
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=40000)
-        except PlaywrightTimeoutError:
+            browser = None
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            except Exception:
-                pass
+                browser = await pw.chromium.launch(**launch_kwargs)
+                ctx = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1366, "height": 768},
+                    locale="vi-VN",
+                    extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9"},
+                )
+                page = await ctx.new_page()
+                await page.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+                )
 
-        # Wait for API response (up to 10s)
-        for _ in range(20):
-            if "jwt" in captured:
-                break
-            await asyncio.sleep(0.5)
+                async def on_response(resp):
+                    if "search-hotel" in resp.url and "jwt" not in captured:
+                        h = dict(resp.request.headers)
+                        captured["jwt"] = h.get("authorization", "")
+                        captured["client_id"] = h.get("clientid", "")
+                        captured["req_body"] = resp.request.post_data or ""
+                        try:
+                            captured["resp_json"] = await resp.json()
+                        except Exception:
+                            pass
 
-        await browser.close()
+                page.on("response", on_response)
 
-    if "jwt" not in captured or not captured["jwt"]:
-        return None
-    return captured["jwt"], captured["client_id"], captured.get("resp_json", {})
+                status_callback("🌐 Đang mở travel.com.vn để lấy token xác thực...")
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=40000)
+                except PlaywrightTimeoutError:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+
+                # Wait for API response (up to 10s)
+                for _ in range(20):
+                    if "jwt" in captured:
+                        break
+                    await asyncio.sleep(0.5)
+            except Exception as e:
+                status_callback(f"⚠️ Chromium thử lần {attempt} lỗi: {type(e).__name__}")
+            finally:
+                if browser:
+                    await browser.close()
+
+        if "jwt" in captured and captured["jwt"]:
+            return captured["jwt"], captured["client_id"], captured.get("resp_json", {})
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +361,14 @@ def run_scrape_travel(
 ) -> list[dict]:
     if status_callback is None:
         status_callback = lambda _: None
+    _ensure_windows_proactor_policy()
     return asyncio.run(_scrape_async(url, destination, status_callback))
 
 
 async def _scrape_async(url: str, destination: str, status_callback) -> list[dict]:
     chromium = get_chromium()
     if not chromium:
-        raise RuntimeError("Không tìm thấy Chromium. Hãy cài 'chromium-browser'.")
+        status_callback("ℹ️ Không thấy Chromium hệ thống, dùng Chromium của Playwright.")
 
     # Step 1: Capture JWT via Playwright
     result = await _capture_jwt(url, chromium, status_callback)
@@ -339,6 +377,7 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
 
     jwt, client_id, first_resp = result
     status_callback(f"✅ Đã lấy được token xác thực")
+    status_callback("ℹ️ Giá Travel.com.vn được quy đổi sang đã gồm thuế phí theo mức ước tính 15%.")
 
     # Derive city info from URL
     parsed_url = urlparse(url)

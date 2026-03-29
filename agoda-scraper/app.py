@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 import re
+import traceback
 from datetime import date, timedelta
 from scraper import build_agoda_url, run_scrape
 from scraper_tripcom import build_tripcom_url, resolve_trip_city, run_scrape_tripcom
@@ -619,7 +620,12 @@ if st.session_state.get("trigger_scrape"):
                     )
             st.session_state.scrape_results = results
         except Exception as e:
-            st.error(f"❌  Lỗi: {str(e)}")
+            # Some exceptions stringify to an empty string; always show a useful message.
+            err_text = str(e).strip() or f"{type(e).__name__}: {repr(e)}"
+            st.error(f"❌  Lỗi: {err_text}")
+            tb_text = traceback.format_exc()
+            with st.expander("🧩 Chi tiết lỗi kỹ thuật"):
+                st.code(tb_text, language="text")
             results = []
 
     st.session_state.is_scraping = False
@@ -715,7 +721,9 @@ if st.session_state.scrape_results:
         col_cfg.update({
             "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ", width="large"),
             "Số đánh giá": st.column_config.TextColumn("📝 Đánh giá", width="small"),
-            "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá/đêm (VND)", width="medium"),
+            "Giá/đêm (chưa gồm thuế phí)": st.column_config.TextColumn("💸 Giá chưa thuế phí", width="medium"),
+            "Giá/đêm (VND)": st.column_config.TextColumn("💰 Giá đã gồm thuế phí", width="medium"),
+            "Thuế phí ước tính": st.column_config.TextColumn("🧾 Thuế phí", width="small"),
             "Nguồn": st.column_config.TextColumn("🌐 Nguồn", width="small"),
         })
     else:  # Mytour
