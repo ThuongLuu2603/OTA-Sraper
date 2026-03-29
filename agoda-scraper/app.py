@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import hashlib
 import re
 import traceback
 from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse
@@ -16,9 +17,12 @@ from market_db import (
     db_ready,
     init_db,
     replace_case_source,
+    replace_tour_case_source,
     list_hotel_cases,
+    list_tour_cases,
     build_cross_channel_compare,
     get_case_rows,
+    get_tour_case_rows,
 )
 
 st.set_page_config(
@@ -229,6 +233,70 @@ def _extract_hotel_case_info(active_source: str, active_url: str, active_destina
         "adults": adults,
         "children": children,
     }
+
+
+def _extract_tour_case_info(active_source: str, active_url: str, active_destination: str) -> dict:
+    parsed = urlparse(active_url or "")
+    qs = parse_qs(parsed.query or "")
+    dest = (active_destination or "").strip()
+
+    def q(*keys: str, default: str = "") -> str:
+        for k in keys:
+            v = qs.get(k)
+            if v and v[0]:
+                return v[0]
+        return default
+
+    def url_fp() -> str:
+        return hashlib.sha1((active_url or "").encode("utf-8", errors="ignore")).hexdigest()[:14]
+
+    if active_source == "FindTourGo":
+        country = (st.session_state.get("_tour_country") or "").strip() or q("where", "country") or dest
+        ps = (st.session_state.get("_tour_period_start") or "").strip() or q(
+            "tourPeriodStart", "periodStart", "tour_period_start"
+        )
+        pe = (st.session_state.get("_tour_period_end") or "").strip() or q(
+            "tourPeriodEnd", "periodEnd", "tour_period_end"
+        )
+        cur = (st.session_state.get("_tour_currency") or "USD").strip() or q("currency", default="USD") or "USD"
+        ps = _normalize_date_text(ps)
+        pe = _normalize_date_text(pe)
+        if not country and not ps and not pe:
+            case_key = f"tour|FindTourGo|url|{url_fp()}"
+        else:
+            case_key = (
+                f"tour|FindTourGo|{_norm_destination_key(country)}|{ps}|{pe}|{_norm_destination_key(cur)}"
+            )
+        return {
+            "case_key": case_key,
+            "destination": country or dest,
+            "period_start": ps,
+            "period_end": pe,
+            "currency": cur,
+        }
+
+    if active_source == "Travel.com.vn":
+        fd = _normalize_date_text(q("fromDate"))
+        if not dest and not fd:
+            case_key = f"tour|Travel.com.vn|url|{url_fp()}"
+        else:
+            case_key = f"tour|Travel.com.vn|{_norm_destination_key(dest)}|{fd}"
+        return {
+            "case_key": case_key,
+            "destination": dest,
+            "period_start": fd,
+            "period_end": "",
+            "currency": "",
+        }
+
+    return {
+        "case_key": f"tour|{active_source}|url|{url_fp()}",
+        "destination": dest,
+        "period_start": "",
+        "period_end": "",
+        "currency": "",
+    }
+
 
 st.markdown("""
 <style>
@@ -1343,6 +1411,44 @@ elif segment_name == "Hotel":
                     else:
                         st.warning("Case này không có dữ liệu chi tiết để nạp.")
 
+elif segment_name == "Tour":
+    with st.expander(f"🗂️ Xem lại case DB tour — {ota_name}", expanded=False):
+        if not DB_OK:
+            st.warning(
+                "Chưa cấu hình Supabase DB. Vào Streamlit Secrets và thêm DATABASE_URL "
+                "hoặc SUPABASE_DB_HOST/PORT/NAME/USER/PASSWORD."
+            )
+        else:
+            tour_cases = list_tour_cases(limit=300, source=ota_name)
+            if not tour_cases:
+                st.caption(f"Chưa có case tour nào của nguồn {ota_name} trong DB.")
+            else:
+                t_options = []
+                t_meta = {}
+                for c in tour_cases:
+                    t_label = (
+                        f"{c.get('destination','')} | {c.get('period_start','')}→{c.get('period_end','') or '—'} | "
+                        f"{c.get('currency','') or '—'} | {c.get('row_count',0)} dòng | cập nhật: {c.get('updated_at','')}"
+                    )
+                    t_options.append(t_label)
+                    t_meta[t_label] = c
+                t_sel = st.selectbox("Case tour đã lưu", t_options, key=f"tour_case_picker_{ota_name}")
+                t_case = t_meta.get(t_sel, {})
+                t_key = t_case.get("case_key", "")
+                st.caption(f"Case key: `{t_key}`")
+                if st.button("📥 Nạp lại case tour vào bảng", key=f"load_tour_case_{ota_name}", use_container_width=True):
+                    loaded = get_tour_case_rows(t_key, ota_name)
+                    if loaded:
+                        st.session_state.scrape_results = loaded
+                        st.session_state.active_destination = t_case.get("destination", "")
+                        st.session_state.active_segment = "Tour"
+                        st.session_state.active_source = ota_name
+                        st.session_state.active_case_key = t_key
+                        st.success(f"Đã nạp {len(loaded)} tour từ DB.")
+                        st.rerun()
+                    else:
+                        st.warning("Case này không có dữ liệu chi tiết để nạp.")
+
 # ── Scraping ──────────────────────────────────────────────────────────────────
 if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
     st.session_state["trigger_scrape"] = False
@@ -1451,6 +1557,18 @@ if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
             status_messages.append(f"⚠️ DB save lỗi: {type(db_err).__name__}: {db_err}")
     elif active_segment == "Hotel":
         st.session_state.active_case_key = _extract_hotel_case_info(active_source, active_url, active_destination)["case_key"]
+    elif active_segment == "Tour" and results:
+        try:
+            t_info = _extract_tour_case_info(active_source, active_url, active_destination)
+            saved_t = replace_tour_case_source(t_info, active_source, results)
+            st.session_state.active_case_key = t_info["case_key"]
+            status_messages.append(
+                f"💾 DB tour: case={t_info['case_key']} | source={active_source} | rows={saved_t}"
+            )
+        except Exception as db_err:
+            status_messages.append(f"⚠️ DB tour lỗi: {type(db_err).__name__}: {db_err}")
+    elif active_segment == "Tour":
+        st.session_state.active_case_key = _extract_tour_case_info(active_source, active_url, active_destination)["case_key"]
 
     if status_messages:
         with st.expander("📋  Nhật ký chi tiết"):

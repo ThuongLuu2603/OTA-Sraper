@@ -344,6 +344,39 @@ def init_db() -> tuple[bool, str]:
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_case ON hotel_snapshot(case_key)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_case_source ON hotel_snapshot(case_key, source)")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tour_case (
+                    case_key TEXT PRIMARY KEY,
+                    destination TEXT,
+                    period_start DATE,
+                    period_end DATE,
+                    currency TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tour_snapshot (
+                    id BIGSERIAL PRIMARY KEY,
+                    case_key TEXT NOT NULL REFERENCES tour_case(case_key) ON DELETE CASCADE,
+                    source TEXT NOT NULL,
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    destination TEXT,
+                    tour_name TEXT,
+                    tour_name_norm TEXT,
+                    tour_code TEXT,
+                    price_text TEXT,
+                    currency TEXT,
+                    depart_city TEXT,
+                    raw_json JSONB
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tour_snapshot_case ON tour_snapshot(case_key)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tour_snapshot_case_source ON tour_snapshot(case_key, source)")
         conn.commit()
         return True, msg
     except Exception as e:
@@ -495,6 +528,152 @@ def replace_case_source(case_info: dict, source: str, rows: list[dict]) -> int:
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def replace_tour_case_source(case_info: dict, source: str, rows: list[dict]) -> int:
+    ok, msg = init_db()
+    if not ok:
+        raise RuntimeError(f"Supabase DB chưa sẵn sàng: {msg}")
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("BEGIN")
+            cur.execute(
+                """
+                INSERT INTO tour_case(case_key, destination, period_start, period_end, currency, created_at, updated_at)
+                VALUES (%s, %s, NULLIF(%s,'')::date, NULLIF(%s,'')::date, NULLIF(%s,''), %s, %s)
+                ON CONFLICT(case_key) DO UPDATE SET
+                  destination=EXCLUDED.destination,
+                  period_start=EXCLUDED.period_start,
+                  period_end=EXCLUDED.period_end,
+                  currency=EXCLUDED.currency,
+                  updated_at=EXCLUDED.updated_at
+                """,
+                (
+                    case_info["case_key"],
+                    case_info.get("destination", ""),
+                    case_info.get("period_start", ""),
+                    case_info.get("period_end", ""),
+                    case_info.get("currency", ""),
+                    now,
+                    now,
+                ),
+            )
+            cur.execute(
+                "DELETE FROM tour_snapshot WHERE case_key = %s AND source = %s",
+                (case_info["case_key"], source),
+            )
+            inserted = 0
+            dest = case_info.get("destination", "")
+            for r in rows or []:
+                if not isinstance(r, dict):
+                    continue
+                name = r.get("Tên tour", "") or ""
+                cur.execute(
+                    """
+                    INSERT INTO tour_snapshot(
+                        case_key, source, captured_at, destination, tour_name, tour_name_norm,
+                        tour_code, price_text, currency, depart_city, raw_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        case_info["case_key"],
+                        source,
+                        now,
+                        dest,
+                        name,
+                        normalize_name(name, dest),
+                        r.get("Mã tour", ""),
+                        r.get("Giá từ", ""),
+                        r.get("Tiền tệ", ""),
+                        r.get("Điểm khởi hành", ""),
+                        Json(r),
+                    ),
+                )
+                inserted += 1
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_tour_cases(limit: int = 200, source: str | None = None) -> list[dict]:
+    ok, _ = db_ready()
+    if not ok:
+        return []
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            if source:
+                cur.execute(
+                    """
+                    SELECT c.case_key, c.destination, c.period_start, c.period_end, c.currency, c.updated_at,
+                           COUNT(s.id) AS row_count,
+                           COUNT(DISTINCT s.source) AS source_count
+                    FROM tour_case c
+                    JOIN tour_snapshot s ON s.case_key = c.case_key
+                    WHERE EXISTS (
+                        SELECT 1 FROM tour_snapshot z
+                        WHERE z.case_key = c.case_key AND z.source = %s
+                    )
+                    GROUP BY c.case_key, c.destination, c.period_start, c.period_end, c.currency, c.updated_at
+                    ORDER BY c.updated_at DESC
+                    LIMIT %s
+                    """,
+                    (source, int(limit)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT c.case_key, c.destination, c.period_start, c.period_end, c.currency, c.updated_at,
+                           COUNT(s.id) AS row_count,
+                           COUNT(DISTINCT s.source) AS source_count
+                    FROM tour_case c
+                    LEFT JOIN tour_snapshot s ON s.case_key = c.case_key
+                    GROUP BY c.case_key, c.destination, c.period_start, c.period_end, c.currency, c.updated_at
+                    ORDER BY c.updated_at DESC
+                    LIMIT %s
+                    """,
+                    (int(limit),),
+                )
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_tour_case_rows(case_key: str, source: str) -> list[dict]:
+    ok, _ = db_ready()
+    if not ok:
+        return []
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT raw_json
+                FROM tour_snapshot
+                WHERE case_key = %s AND source = %s
+                ORDER BY id ASC
+                """,
+                (case_key, source),
+            )
+            out: list[dict] = []
+            for row in cur.fetchall():
+                raw = row.get("raw_json")
+                if isinstance(raw, dict):
+                    out.append(raw)
+                elif isinstance(raw, str) and raw.strip():
+                    try:
+                        out.append(json.loads(raw))
+                    except Exception:
+                        pass
+            return out
     finally:
         conn.close()
 
