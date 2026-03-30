@@ -494,7 +494,7 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
 
             # Wait for first GraphQL response (max 20s)
             try:
-                city_search_data = await asyncio.wait_for(gql_queue.get(), timeout=20)
+                city_search_data = await asyncio.wait_for(gql_queue.get(), timeout=40)
             except asyncio.TimeoutError:
                 if status_callback:
                     status_callback("Không nhận được dữ liệu từ Agoda. Kiểm tra URL.")
