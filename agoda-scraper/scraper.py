@@ -545,7 +545,7 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
 
                 # Wait for next GraphQL response (max 30s)
                 try:
-                    city_search_data = await asyncio.wait_for(gql_queue.get(), timeout=30)
+                    city_search_data = await asyncio.wait_for(gql_queue.get(), timeout=340)
                 except asyncio.TimeoutError:
                     if status_callback:
                         status_callback(f"Timeout trang {current_page}. Thử lại...")
@@ -553,7 +553,7 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
                     await page.evaluate("window.scrollBy(0, 100)")
                     await asyncio.sleep(2)
                     try:
-                        city_search_data = await asyncio.wait_for(gql_queue.get(), timeout=15)
+                        city_search_data = await asyncio.wait_for(gql_queue.get(), timeout=20)
                     except asyncio.TimeoutError:
                         if status_callback:
                             status_callback(f"Không lấy được dữ liệu trang {current_page}. Dừng.")
