@@ -66,6 +66,7 @@ def _dlg_confirm_delete_hotel_case():
             ok_del, msg_del = delete_hotel_case_source(ck, ota)
             st.session_state.pop("_hotel_case_delete_draft", None)
             if ok_del:
+                _invalidate_hotel_case_list_cache()
                 if st.session_state.get("active_case_key") == ck and st.session_state.get("active_source") == ota:
                     st.session_state.scrape_results = None
                 st.session_state.pop("global_compare_df", None)
@@ -105,6 +106,7 @@ def _dlg_confirm_delete_tour_case():
             ok_del, msg_del = delete_tour_case_source(ck, ota)
             st.session_state.pop("_tour_case_delete_draft", None)
             if ok_del:
+                _invalidate_tour_case_list_cache()
                 if st.session_state.get("active_case_key") == ck and st.session_state.get("active_source") == ota:
                     st.session_state.scrape_results = None
                 st.session_state["_tour_db_feedback"] = ("ok", msg_del)
@@ -131,12 +133,21 @@ def normalize_agoda_direct_url(raw_url: str) -> str:
         return raw_url.strip()
 
 
+_HOTEL_ID_GEO_KEYS = frozenset(
+    {"Mã Property Agoda", "ID khách sạn Travel", "Mã property (OTA)", "Vĩ độ", "Kinh độ"}
+)
+
 HOTEL_RESULT_COLUMNS = [
     "Phân khúc",
     "Nguồn",
     "Tỉnh thành / Điểm đến",
     "Tên khách sạn",
     "Địa chỉ",
+    "Mã Property Agoda",
+    "ID khách sạn Travel",
+    "Mã property (OTA)",
+    "Vĩ độ",
+    "Kinh độ",
     "Hạng sao",
     "Điểm đánh giá",
     "Số đánh giá",
@@ -148,6 +159,19 @@ HOTEL_RESULT_COLUMNS = [
     "Chính sách hoàn hủy",
     "Link khách sạn",
 ]
+
+
+def hotel_table_column_order(source: str) -> list[str]:
+    """Chỉ Travel.com.vn có 2 cột ID (Agoda + Travel); OTA khác: một mã property + geo."""
+    keep = {
+        "Agoda": {"Mã Property Agoda", "Vĩ độ", "Kinh độ"},
+        "Trip.com": {"Mã property (OTA)", "Vĩ độ", "Kinh độ"},
+        "Mytour.vn": {"Mã property (OTA)", "Vĩ độ", "Kinh độ"},
+        "iVIVU": {"Mã property (OTA)", "Vĩ độ", "Kinh độ"},
+        "Travel.com.vn": {"Mã Property Agoda", "ID khách sạn Travel", "Vĩ độ", "Kinh độ"},
+    }
+    ks = keep.get(source, {"Vĩ độ", "Kinh độ"})
+    return [c for c in HOTEL_RESULT_COLUMNS if c not in _HOTEL_ID_GEO_KEYS or c in ks]
 
 
 TOUR_RESULT_COLUMNS = [
@@ -192,6 +216,11 @@ def normalize_hotel_rows(rows: list, source: str, destination: str) -> list:
             "Tỉnh thành / Điểm đến": _pick_text(row, "Tỉnh thành / Điểm đến", "Tỉnh/Thành") or destination,
             "Tên khách sạn": _pick_text(row, "Tên khách sạn"),
             "Địa chỉ": _pick_text(row, "Địa chỉ", "Địa điểm nổi bật"),
+            "Mã Property Agoda": _pick_text(row, "Mã Property Agoda"),
+            "ID khách sạn Travel": _pick_text(row, "ID khách sạn Travel"),
+            "Mã property (OTA)": _pick_text(row, "Mã property (OTA)"),
+            "Vĩ độ": _pick_text(row, "Vĩ độ"),
+            "Kinh độ": _pick_text(row, "Kinh độ"),
             "Hạng sao": _pick_text(row, "Hạng sao"),
             "Điểm đánh giá": _pick_text(row, "Điểm đánh giá"),
             "Số đánh giá": _pick_text(row, "Số đánh giá"),
@@ -583,6 +612,34 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
+def _invalidate_hotel_case_list_cache() -> None:
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and k.startswith("_hotel_case_list_"):
+            st.session_state.pop(k, None)
+
+
+def _invalidate_tour_case_list_cache() -> None:
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and k.startswith("_tour_case_list_"):
+            st.session_state.pop(k, None)
+
+
+def _cached_list_hotel_cases(limit: int, source: str | None) -> list:
+    """Tránh query DB mỗi lần rerun Streamlit (cùng phiên, cùng nguồn)."""
+    key = f"_hotel_case_list_{source or '__all__'}_{limit}"
+    if key not in st.session_state:
+        st.session_state[key] = list_hotel_cases(limit=limit, source=source)
+    return st.session_state[key]
+
+
+def _cached_list_tour_cases(limit: int, source: str) -> list:
+    key = f"_tour_case_list_{source}_{limit}"
+    if key not in st.session_state:
+        st.session_state[key] = list_tour_cases(limit=limit, source=source)
+    return st.session_state[key]
+
+
 # ── Session state defaults ──────────────────────────────────────────────────
 for key, default in [
     ("scrape_results", None), ("is_scraping", False),
@@ -598,7 +655,17 @@ for key, default in [
         st.session_state[key] = default
 
 DB_CFG_OK, DB_INFO = db_ready()
-_db_init_ok, _db_init_msg = init_db()
+# init_db() mở kết nối + DDL — chỉ chạy một lần sau khi cấu hình DB đúng (mỗi phiên Streamlit).
+if not DB_CFG_OK:
+    _db_init_ok, _db_init_msg = False, DB_INFO
+elif st.session_state.get("_db_schema_initialized"):
+    _db_init_ok = True
+    _db_init_msg = st.session_state.get("_db_schema_info_msg", DB_INFO)
+else:
+    _db_init_ok, _db_init_msg = init_db()
+    if _db_init_ok:
+        st.session_state["_db_schema_initialized"] = True
+        st.session_state["_db_schema_info_msg"] = _db_init_msg
 DB_OK = DB_CFG_OK and _db_init_ok
 if DB_CFG_OK and not _db_init_ok:
     DB_INFO = _db_init_msg
@@ -1395,7 +1462,7 @@ if segment_name == "Hotel" and compare_tool_mode:
         )
     else:
         st.caption(f"DB: {DB_INFO}")
-        all_case_rows = list_hotel_cases(limit=300)
+        all_case_rows = _cached_list_hotel_cases(300, None)
         if not all_case_rows:
             st.caption("Chưa có case nào trong DB.")
         else:
@@ -1416,9 +1483,15 @@ if segment_name == "Hotel" and compare_tool_mode:
             )
             selected_cmp_case = cmp_map.get(selected_cmp_label, "")
 
-            if st.button("🔎 So sánh", key="sidebar_tool_compare_btn", use_container_width=True, type="primary"):
-                cmp_rows = build_cross_channel_compare(selected_cmp_case)
-                st.session_state.global_compare_df = pd.DataFrame(cmp_rows) if cmp_rows else pd.DataFrame()
+            cmp_b1, cmp_b2 = st.columns(2, gap="small")
+            with cmp_b1:
+                if st.button("🔎 So sánh", key="sidebar_tool_compare_btn", use_container_width=True, type="primary"):
+                    cmp_rows = build_cross_channel_compare(selected_cmp_case)
+                    st.session_state.global_compare_df = pd.DataFrame(cmp_rows) if cmp_rows else pd.DataFrame()
+            with cmp_b2:
+                if st.button("🔄 Làm mới danh sách", key="refresh_compare_cases", use_container_width=True):
+                    _invalidate_hotel_case_list_cache()
+                    st.rerun()
 
             gdf = st.session_state.get("global_compare_df")
             if isinstance(gdf, pd.DataFrame):
@@ -1458,7 +1531,10 @@ elif segment_name == "Hotel":
                 "hoặc SUPABASE_DB_HOST/PORT/NAME/USER/PASSWORD."
             )
         else:
-            source_cases = list_hotel_cases(limit=300, source=ota_name)
+            if st.button("🔄 Làm mới danh sách case từ DB", key=f"refresh_cases_{ota_name}"):
+                _invalidate_hotel_case_list_cache()
+                st.rerun()
+            source_cases = _cached_list_hotel_cases(300, ota_name)
             if not source_cases:
                 st.caption(f"Chưa có case nào của kênh {ota_name} trong DB.")
             else:
@@ -1529,7 +1605,10 @@ elif segment_name == "Tour":
                 "hoặc SUPABASE_DB_HOST/PORT/NAME/USER/PASSWORD."
             )
         else:
-            tour_cases = list_tour_cases(limit=300, source=ota_name)
+            if st.button("🔄 Làm mới danh sách case tour từ DB", key=f"refresh_tour_cases_{ota_name}"):
+                _invalidate_tour_case_list_cache()
+                st.rerun()
+            tour_cases = _cached_list_tour_cases(300, ota_name)
             if not tour_cases:
                 st.caption(f"Chưa có case tour nào của nguồn {ota_name} trong DB.")
             else:
@@ -1687,6 +1766,7 @@ if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
         try:
             case_info = _extract_hotel_case_info(active_source, active_url, active_destination)
             saved_count = replace_case_source(case_info, active_source, results)
+            _invalidate_hotel_case_list_cache()
             st.session_state.active_case_key = case_info["case_key"]
             status_messages.append(
                 f"💾 DB: cập nhật case={case_info['case_key']} | source={active_source} | rows={saved_count}"
@@ -1699,6 +1779,7 @@ if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
         try:
             t_info = _extract_tour_case_info(active_source, active_url, active_destination)
             saved_t = replace_tour_case_source(t_info, active_source, results)
+            _invalidate_tour_case_list_cache()
             st.session_state.active_case_key = t_info["case_key"]
             status_messages.append(
                 f"💾 DB tour: case={t_info['case_key']} | source={active_source} | rows={saved_t}"
@@ -1731,7 +1812,9 @@ if (not compare_tool_mode) and st.session_state.scrape_results:
             if col not in df.columns:
                 df[col] = ""
         df = df[HOTEL_RESULT_COLUMNS]
+        hotel_display_cols = hotel_table_column_order(active_source)
     else:
+        hotel_display_cols = []
         for col in TOUR_RESULT_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
@@ -1851,6 +1934,11 @@ if (not compare_tool_mode) and st.session_state.scrape_results:
             "Tỉnh thành / Điểm đến": st.column_config.TextColumn("📍 Điểm đến", width="small"),
             "Tên khách sạn": st.column_config.TextColumn("🏨 Tên khách sạn", width="large"),
             "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ", width="large"),
+            "Mã Property Agoda": st.column_config.TextColumn("🔑 Agoda ID", width="small"),
+            "ID khách sạn Travel": st.column_config.TextColumn("🆔 Travel ID", width="small"),
+            "Mã property (OTA)": st.column_config.TextColumn("🆔 Property ID", width="small"),
+            "Vĩ độ": st.column_config.TextColumn("φ Vĩ độ", width="small"),
+            "Kinh độ": st.column_config.TextColumn("λ Kinh độ", width="small"),
             "Hạng sao": st.column_config.TextColumn("⭐ Sao", width="small"),
             "Điểm đánh giá": st.column_config.TextColumn("📊 Đánh giá", width="small"),
             "Số đánh giá": st.column_config.TextColumn("📝 Số đánh giá", width="small"),
@@ -1863,7 +1951,14 @@ if (not compare_tool_mode) and st.session_state.scrape_results:
             "Link khách sạn": st.column_config.LinkColumn("🔗 Link", width="small"),
         }
 
-    st.dataframe(fdf, use_container_width=True, height=480, column_config=col_cfg)
+    if active_segment == "Hotel":
+        fdf_show = fdf[hotel_display_cols]
+        col_cfg_show = {k: v for k, v in col_cfg.items() if k in hotel_display_cols}
+    else:
+        fdf_show = fdf
+        col_cfg_show = col_cfg
+
+    st.dataframe(fdf_show, use_container_width=True, height=480, column_config=col_cfg_show)
 
     # ── Export ──
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
@@ -1873,12 +1968,13 @@ if (not compare_tool_mode) and st.session_state.scrape_results:
     with dl1:
         out = io.BytesIO()
         sheet = f"{active_source} - {active_destination}"[:31]
+        df_xlsx = df[hotel_display_cols] if active_segment == "Hotel" else df
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name=sheet)
+            df_xlsx.to_excel(writer, index=False, sheet_name=sheet)
             ws = writer.sheets[sheet]
             widths = [18, 45, 35, 45, 12, 18, 18, 14, 18, 20, 35, 55]
             from openpyxl.utils import get_column_letter
-            for i, w in enumerate(widths[:len(df.columns)]):
+            for i, w in enumerate(widths[:len(df_xlsx.columns)]):
                 ws.column_dimensions[get_column_letter(i + 1)].width = w
         out.seek(0)
         st.download_button(
@@ -1888,7 +1984,8 @@ if (not compare_tool_mode) and st.session_state.scrape_results:
             use_container_width=True, type="primary"
         )
     with dl2:
-        csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+        df_csv = df[hotel_display_cols] if active_segment == "Hotel" else df
+        csv_data = df_csv.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
             label="📄  Tải CSV (.csv)", data=csv_data.encode("utf-8-sig"),
             file_name=f"{active_source}_{active_destination}.csv",

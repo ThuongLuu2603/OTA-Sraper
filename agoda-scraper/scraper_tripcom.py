@@ -10,6 +10,8 @@ import sys
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_bootstrap import ensure_playwright_chromium
 
+from geo_extract import scan_json_for_latlng
+
 # ---------------------------------------------------------------------------
 # Known Vietnamese city IDs on Trip.com (cityId, countryId=111)
 # ---------------------------------------------------------------------------
@@ -184,6 +186,87 @@ def _parse_stars(text: str) -> str:
     return ""
 
 
+def _trip_coord_str(v) -> str:
+    if v is None:
+        return ""
+    try:
+        x = float(v)
+        return f"{x:.8f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _trip_lat_lng_from_api_item(item: dict) -> tuple[str, str]:
+    if not isinstance(item, dict):
+        return "", ""
+    la = (
+        item.get("latitude")
+        or item.get("lat")
+        or item.get("hotelLat")
+        or item.get("googleLatitude")
+        or item.get("mapLatitude")
+    )
+    lo = (
+        item.get("longitude")
+        or item.get("lng")
+        or item.get("hotelLng")
+        or item.get("googleLongitude")
+        or item.get("mapLongitude")
+    )
+    lat_s, lng_s = _trip_coord_str(la), _trip_coord_str(lo)
+    if lat_s and lng_s:
+        return lat_s, lng_s
+    for nest_key in ("position", "geo", "location", "hotelPosition", "map"):
+        block = item.get(nest_key)
+        if isinstance(block, dict):
+            la = block.get("latitude") or block.get("lat")
+            lo = block.get("longitude") or block.get("lng")
+            lat_s, lng_s = _trip_coord_str(la), _trip_coord_str(lo)
+            if lat_s and lng_s:
+                return lat_s, lng_s
+    return scan_json_for_latlng(item)
+
+
+def _trip_property_id_from_dom(hotel_id: str, link: str) -> str:
+    s = str(hotel_id or "").strip()
+    if s.isdigit():
+        return s
+    link = str(link or "")
+    for rx in (
+        r"[?&]hotelId=(\d+)",
+        r"[?&]hotel_id=(\d+)",
+        r"hotelId=(\d+)",
+        r"/(\d{6,})\.html",
+    ):
+        m = re.search(rx, link, re.I)
+        if m:
+            return m.group(1)
+    return s if s and not s.startswith("http") else ""
+
+
+def _trip_geo_id_bundle(
+    hotel_id: str,
+    link: str,
+    api_item: dict | None,
+    dom_lat: str | float | None = None,
+    dom_lng: str | float | None = None,
+) -> dict:
+    lat_s, lng_s = "", ""
+    if isinstance(api_item, dict):
+        lat_s, lng_s = _trip_lat_lng_from_api_item(api_item)
+    if (not lat_s or not lng_s) and dom_lat not in (None, "") and dom_lng not in (None, ""):
+        la, lo = _trip_coord_str(dom_lat), _trip_coord_str(dom_lng)
+        if la and lo:
+            lat_s, lng_s = la, lo
+    return {
+        "Mã Property Agoda": "",
+        "ID khách sạn Travel": "",
+        "Mã property (OTA)": _trip_property_id_from_dom(hotel_id, link),
+        "Vĩ độ": lat_s,
+        "Kinh độ": lng_s,
+    }
+
+
 def _parse_location(text: str) -> str:
     """Extract 'Gần X' location hint — skip customer review quotes first."""
     # Remove quoted customer review snippets like "Gần sân bay""Dễ đi lại"
@@ -277,7 +360,50 @@ HOTEL_CARD_JS = """() => {
         }
         if (!name) return;
 
-        results.push({ hotelId, name, fullText, link });
+        let cardLat = '';
+        let cardLng = '';
+        const pn = (x) => {
+            if (x == null || x === '') return NaN;
+            const n = parseFloat(String(x).replace(',', '.'));
+            return Number.isFinite(n) ? n : NaN;
+        };
+        const setPair = (a, b) => {
+            const la = pn(a), lo = pn(b);
+            if (Number.isFinite(la) && Number.isFinite(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180
+                && !(la === 0 && lo === 0)) {
+                cardLat = String(la);
+                cardLng = String(lo);
+                return true;
+            }
+            return false;
+        };
+        if (card.dataset) {
+            setPair(
+                card.dataset.lat || card.dataset.latitude || card.dataset.hotelLat,
+                card.dataset.lng || card.dataset.longitude || card.dataset.hotelLng
+            );
+        }
+        if (!cardLat || !cardLng) {
+            let el = card;
+            for (let d = 0; d < 5 && el && (!cardLat || !cardLng); d++) {
+                if (el.getAttribute) {
+                    setPair(
+                        el.getAttribute('data-lat') || el.getAttribute('data-latitude'),
+                        el.getAttribute('data-lng') || el.getAttribute('data-longitude')
+                    );
+                }
+                el = el.parentElement;
+            }
+        }
+        if (!cardLat || !cardLng) {
+            const html = (card.outerHTML || '').substring(0, 120000);
+            const m = html.match(
+                /["'](?:latitude|lat)["']\\s*:\\s*([0-9]+\\.?[0-9]*)\\s*[,}]\\s*["'](?:longitude|lng|lon)["']\\s*:\\s*([0-9]+\\.?[0-9]*)/i
+            );
+            if (m) setPair(m[1], m[2]);
+        }
+
+        results.push({ hotelId, name, fullText, link, cardLat, cardLng });
     });
 
     return { results, debug: { usedSel, cardCount: cards.length } };
@@ -343,6 +469,9 @@ async def _extract_page_hotels(page, destination: str, status_callback=None) -> 
             "Giá/đêm (VND)": price,
             "Chính sách hoàn hủy": cancellation,
             "Link khách sạn": link,
+            **_trip_geo_id_bundle(
+                str(hotel_id), link, None, r.get("cardLat"), r.get("cardLng")
+            ),
         })
     return hotels
 
@@ -500,6 +629,9 @@ async def _scroll_and_extract(
             "Giá/đêm (VND)": _parse_vnd_price(clean),
             "Chính sách hoàn hủy": _parse_cancellation(clean),
             "Link khách sạn": link,
+            **_trip_geo_id_bundle(
+                str(hid), link, None, r.get("cardLat"), r.get("cardLng")
+            ),
         })
     return hotels
 
@@ -623,6 +755,7 @@ def _hotels_from_api_list(items: list, destination: str) -> list[dict]:
             "Giá/đêm (VND)": price,
             "Chính sách hoàn hủy": "",
             "Link khách sạn": link,
+            **_trip_geo_id_bundle(hid, link, item),
         })
     return hotels
 
@@ -1061,6 +1194,7 @@ def _parse_hotels_from_api(data: dict, destination: str) -> list[dict]:
                 "Giá/đêm (VND)": price,
                 "Chính sách hoàn hủy": "",
                 "Link khách sạn": link,
+                **_trip_geo_id_bundle(hid, link, item),
             })
     except Exception:
         pass

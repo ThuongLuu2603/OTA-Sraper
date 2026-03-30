@@ -13,14 +13,90 @@ import math
 import re
 import sys
 from datetime import date
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse
 
 import requests as _requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from playwright_bootstrap import ensure_playwright_chromium
 
+from geo_extract import scan_json_for_latlng
+
 IVIVU_SEARCH_API = "https://apiportal.ivivu.com/web_prot/gate/search/searchhotel?keyword={kw}"
+
+
+def _ivivu_page_url_candidates(raw_url: str) -> list[str]:
+    """Thử www / không www — một số môi trường chỉ phân giải được một dạng."""
+    u = (raw_url or "").strip()
+    if not u:
+        return []
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u.lstrip("/")
+    p = urlparse(u)
+    scheme = p.scheme or "https"
+    net = (p.netloc or "").strip()
+    path = p.path if p.path else "/"
+    if not net:
+        return [u]
+    low = net.lower()
+    hosts = [net]
+    if low.startswith("www."):
+        hosts.append(net[4:])
+    else:
+        hosts.append("www." + net)
+    seen: set[str] = set()
+    out: list[str] = []
+    for h in hosts:
+        cand = urlunparse((scheme, h, path, p.params, p.query, p.fragment))
+        if cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
+async def _ivivu_goto_with_fallbacks(page, url: str, status_callback) -> None:
+    """goto bền hơn: thử www / không www + domcontentloaded / load (tránh networkidle)."""
+    last_err: BaseException | None = None
+    candidates = _ivivu_page_url_candidates(url)
+    if not candidates:
+        raise RuntimeError("URL iVIVU trống hoặc không hợp lệ.")
+    orig_norm = (url or "").strip().rstrip("/")
+
+    for go_url in candidates:
+        hard_fail = False
+        for wait_until, timeout_ms in (("domcontentloaded", 65000), ("load", 45000)):
+            try:
+                await page.goto(go_url, wait_until=wait_until, timeout=timeout_ms)
+                if go_url.rstrip("/") != orig_norm:
+                    status_callback(f"ℹ️ Đã mở iVIVU qua: {go_url[:72]}…")
+                return
+            except PlaywrightTimeoutError as e:
+                last_err = e
+            except Exception as e:
+                last_err = e
+                es = str(e)
+                if "ERR_NAME_NOT_RESOLVED" in es:
+                    status_callback(
+                        "⚠️ DNS không phân giải được tên miền — thử phiên bản URL khác…"
+                    )
+                    hard_fail = True
+                    break
+                if "ERR_CONNECTION" in es or "ERR_INTERNET_DISCONNECTED" in es:
+                    status_callback(f"⚠️ Lỗi kết nối: {es[:120]}")
+                    hard_fail = True
+                    break
+        if hard_fail:
+            continue
+
+    hint = ""
+    if last_err and "ERR_NAME_NOT_RESOLVED" in str(last_err):
+        hint = (
+            " Kiểm tra DNS/mạng (ví dụ DNS 8.8.8.8), VPN/proxy, firewall; "
+            "thử mở https://www.ivivu.com trên Chrome cùng máy."
+        )
+    raise RuntimeError(
+        "Không mở được trang iVIVU sau khi thử nhiều URL và chế độ tải." + hint
+    ) from last_err
 
 def _ensure_windows_proactor_policy() -> None:
     if sys.platform.startswith("win") and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
@@ -106,7 +182,51 @@ def resolve_ivivu_region_url(destination: str) -> str | None:
         return None
 
 
+def _ivivu_coord_str(v) -> str:
+    if v is None:
+        return ""
+    try:
+        x = float(v)
+        return f"{x:.8f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _ivivu_lat_lng(item: dict) -> tuple[str, str]:
+    if not isinstance(item, dict):
+        return "", ""
+    la = item.get("latitude") or item.get("lat") or item.get("mapLat")
+    lo = item.get("longitude") or item.get("lng") or item.get("mapLng")
+    lat_s, lng_s = _ivivu_coord_str(la), _ivivu_coord_str(lo)
+    if lat_s and lng_s:
+        return lat_s, lng_s
+    for key in ("location", "geo", "position"):
+        b = item.get(key)
+        if isinstance(b, dict):
+            la = b.get("latitude") or b.get("lat")
+            lo = b.get("longitude") or b.get("lng")
+            lat_s, lng_s = _ivivu_coord_str(la), _ivivu_coord_str(lo)
+            if lat_s and lng_s:
+                return lat_s, lng_s
+    lat_s, lng_s = scan_json_for_latlng(item)
+    return lat_s, lng_s
+
+
+def _ivivu_property_id(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    for k in ("hotelId", "hotelID", "id", "productId", "hotelCode", "code"):
+        v = item.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
 def _parse_hotel(item: dict, destination: str) -> dict:
+    lat_s, lng_s = _ivivu_lat_lng(item)
     return {
         "Tên khách sạn": item.get("hotelName", "").strip(),
         "Link khách sạn": _full_url(item.get("hotelLink") or item.get("url") or ""),
@@ -118,6 +238,11 @@ def _parse_hotel(item: dict, destination: str) -> dict:
         "Chính sách hoàn hủy": "",
         "Nguồn": "ivivu.com",
         "Điểm đến": destination,
+        "Mã Property Agoda": "",
+        "ID khách sạn Travel": "",
+        "Mã property (OTA)": _ivivu_property_id(item),
+        "Vĩ độ": lat_s,
+        "Kinh độ": lng_s,
     }
 
 
@@ -152,11 +277,8 @@ async def _capture_search_context(url: str, status_callback):
 
         page.on("response", on_response)
 
-        status_callback("🌐 Đang mở iVIVU để lấy ngữ cảnh truy vấn...")
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-        except PlaywrightTimeoutError:
-            await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+        status_callback("🌐 Đang mở iVIVU để lấy ngữ cảnh truy vấn…")
+        await _ivivu_goto_with_fallbacks(page, url, status_callback)
 
         for _ in range(20):
             if "body" in captured:
