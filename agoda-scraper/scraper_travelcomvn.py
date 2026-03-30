@@ -85,8 +85,7 @@ CITY_MAP: dict[str, tuple[str, int, str]] = {
 
 API_URL = "https://api2.travel.com.vn/core/Hotel/search-hotel"
 PAGE_SIZE = 20
-# Travel.com.vn list API does not expose explicit tax/fee fields.
-# Use a configurable estimate for gross price to align with "đã gồm thuế phí" display.
+# Khi API không trả gross / thuế tách → hệ số dự phòng cho cột "đã gồm thuế phí".
 TRAVEL_TAX_FEE_RATE = 0.15
 
 
@@ -209,6 +208,109 @@ def _price_with_tax_fee(price):
         return None
 
 
+def _travel_positive_float(val) -> float | None:
+    try:
+        x = float(val)
+        return x if x > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _travel_ci_map(d: dict) -> dict[str, object]:
+    return {str(k).lower().replace("_", ""): v for k, v in d.items()}
+
+
+def _travel_price_chunks(hotel: dict) -> list[dict]:
+    """Các dict con có thể chứa gross / thuế (tuỳ payload search-hotel)."""
+    out: list[dict] = [hotel]
+    for nk in (
+        "pricing",
+        "lowestRoom",
+        "lowestRoomInfo",
+        "room",
+        "roomInfo",
+        "rate",
+        "rates",
+        "hotelPrice",
+    ):
+        sub = hotel.get(nk)
+        if isinstance(sub, dict):
+            out.append(sub)
+        elif isinstance(sub, list):
+            for it in sub[:5]:
+                if isinstance(it, dict):
+                    out.append(it)
+    return out
+
+
+def _travel_resolve_gross_price(hotel: dict) -> tuple[float | None, float | None, str]:
+    """
+    Trả về (giá đêm hiển thị đã gồm thuế/phí, giá gốc price, ghi chú nguồn).
+
+    Thứ tự: (1) field tổng/gross rõ ràng từ API; (2) price + các khoản tax/fee tách;
+    (3) price × (1 + TRAVEL_TAX_FEE_RATE).
+
+    Payload thực tế chỉ có thể xác nhận khi bắt JSON (JWT). Các tên khóa dưới đây
+    là dự đoán phổ biến — bổ sung khi dump được mẫu từ api2.travel.com.vn.
+    """
+    base = _travel_positive_float(hotel.get("price"))
+    chunks = _travel_price_chunks(hotel)
+
+    gross_keys = (
+        "grossprice",
+        "totalprice",
+        "finalprice",
+        "totalamount",
+        "grandtotal",
+        "priceincludedvat",
+        "priceincludetax",
+        "pricewithtax",
+        "amountaftertax",
+        "sellingprice",
+        "displaytotal",
+    )
+    for ch in chunks:
+        cmap = _travel_ci_map(ch)
+        for gk in gross_keys:
+            gv = _travel_positive_float(cmap.get(gk))
+            if gv is None:
+                continue
+            if base is None:
+                return round(gv), base, f"từ API ({gk})"
+            if gv > base * 1.005:
+                return round(gv), base, f"từ API ({gk})"
+
+    tax_keys = (
+        "tax",
+        "taxamount",
+        "taxvalue",
+        "vat",
+        "vatamount",
+        "valueaddedtax",
+        "servicefee",
+        "servicecharge",
+        "processingfee",
+        "totalfee",
+        "fees",
+        "surcharge",
+    )
+    for ch in chunks:
+        cmap = _travel_ci_map(ch)
+        extra = 0.0
+        for tk in tax_keys:
+            tv = _travel_positive_float(cmap.get(tk))
+            if tv is not None:
+                extra += tv
+        if base is not None and extra > 0:
+            return round(base + extra), base, "từ API (price + thuế/phí)"
+
+    if base is not None:
+        est = _price_with_tax_fee(base)
+        return est, base, f"ước tính {int(TRAVEL_TAX_FEE_RATE * 100)}%"
+
+    return None, None, ""
+
+
 def _fmt_stars(rating) -> str:
     if rating is None:
         return ""
@@ -319,7 +421,7 @@ def _hotel_url(hotel: dict, city_slug: str = "") -> str:
 
 def _parse_hotel(hotel: dict, destination: str, city_slug: str) -> dict:
     base_price = hotel.get("price")
-    gross_price = _price_with_tax_fee(base_price)
+    gross_price, _, price_source_note = _travel_resolve_gross_price(hotel)
     agoda_pid = _travel_agoda_property_id(hotel)
     lat_s, lng_s = _travel_lat_lng(hotel)
     travel_hid = _travel_hotel_id_raw(hotel)
@@ -338,7 +440,7 @@ def _parse_hotel(hotel: dict, destination: str, city_slug: str) -> dict:
         "Số đánh giá": str(int(hotel.get("reviewCount") or 0)) if hotel.get("reviewCount") else "",
         "Giá/đêm (chưa gồm thuế phí)": _fmt_vnd(base_price),
         "Giá/đêm (VND)": _fmt_vnd(gross_price if gross_price is not None else base_price),
-        "Thuế phí ước tính": f"{int(TRAVEL_TAX_FEE_RATE * 100)}%",
+        "Thuế phí ước tính": price_source_note or f"{int(TRAVEL_TAX_FEE_RATE * 100)}%",
         "Chính sách hoàn hủy": "",
         "Nguồn": "travel.com.vn",
         "Điểm đến": destination,
@@ -458,7 +560,10 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
 
     jwt, client_id, first_resp = result
     status_callback(f"✅ Đã lấy được token xác thực")
-    status_callback("ℹ️ Giá Travel.com.vn được quy đổi sang đã gồm thuế phí theo mức ước tính 15%.")
+    status_callback(
+        "ℹ️ Giá đã gồm thuế/phí: ưu tiên field gross hoặc price+thuế từ API nếu có; "
+        f"không thì ×{1 + TRAVEL_TAX_FEE_RATE:.2f} ({int(TRAVEL_TAX_FEE_RATE * 100)}% ước tính)."
+    )
 
     # Derive city info from URL
     parsed_url = urlparse(url)
