@@ -10,6 +10,7 @@ from datetime import datetime
 from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_bootstrap import ensure_playwright_chromium
+from geo_extract import scan_json_for_latlng
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +586,13 @@ def _extract_agoda_property_geo(hotel: dict) -> tuple[str, str, str]:
 
     if (not lat_s or not lng_s) and isinstance(hotel, dict):
         la, lo = _scan_hotel_node_for_latlng(hotel)
+        if la and lo:
+            lat_s, lng_s = la, lo
+
+    # Payload citySearch không thống nhất: một số property chỉ có lat/lng dưới tên khóa lạ
+    # (geo_extract quét chuẩn hóa key + bỏ 0,0) — bổ sung sau khi các bước trên không ra.
+    if (not lat_s or not lng_s) and isinstance(hotel, dict):
+        la, lo = scan_json_for_latlng(hotel, max_visits=650)
         if la and lo:
             lat_s, lng_s = la, lo
 

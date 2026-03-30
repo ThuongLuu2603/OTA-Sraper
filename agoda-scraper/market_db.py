@@ -5,6 +5,7 @@ import socket
 import unicodedata
 from datetime import datetime
 from difflib import SequenceMatcher
+from math import atan2, cos, radians, sin, sqrt
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse, urlunparse, quote
 
@@ -856,6 +857,80 @@ def delete_hotel_case_source(case_key: str, source: str) -> tuple[bool, str]:
         conn.close()
 
 
+def _raw_json_dict(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            o = json.loads(raw)
+            return o if isinstance(o, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _norm_property_id(val: Any) -> str:
+    """Chuẩn hóa mã property (số Agoda, ID Travel, v.v.) để so khớp giữa kênh."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d{4,})", s)
+    if m:
+        return m.group(1)
+    try:
+        f = float(s.replace(",", "."))
+        if f > 0 and f == int(f):
+            return str(int(f))
+    except ValueError:
+        pass
+    return s
+
+
+def _parse_geo_coord(val: Any) -> float | None:
+    if val is None:
+        return None
+    s = str(val).strip().replace(",", ".")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _coords_valid(lat: float | None, lng: float | None) -> bool:
+    if lat is None or lng is None:
+        return False
+    return -90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Khoảng cách địa lý (mét), WGS84."""
+    r_earth = 6371000.0
+    p1, p2 = radians(lat1), radians(lat2)
+    dp = radians(lat2 - lat1)
+    dl = radians(lon2 - lon1)
+    a = sin(dp / 2) ** 2 + cos(p1) * cos(p2) * sin(dl / 2) ** 2
+    return 2 * r_earth * atan2(sqrt(a), sqrt(max(0.0, 1.0 - a)))
+
+
+def _enrich_snapshot_row_for_compare(row: dict) -> dict:
+    """
+    Gắn cmp_* từ raw_json (bản ghi scrape đầy đủ) để so sánh đa kênh.
+    Không giữ raw_json trong dict trả về (tránh nặng / lặp).
+    """
+    out = dict(row)
+    raw = _raw_json_dict(out.pop("raw_json", None))
+    out["cmp_agoda_id"] = _norm_property_id(raw.get("Mã Property Agoda"))
+    out["cmp_travel_id"] = _norm_property_id(raw.get("ID khách sạn Travel"))
+    out["cmp_ota_id"] = _norm_property_id(raw.get("Mã property (OTA)"))
+    out["cmp_lat"] = _parse_geo_coord(raw.get("Vĩ độ"))
+    out["cmp_lng"] = _parse_geo_coord(raw.get("Kinh độ"))
+    return out
+
+
 def get_hotels_by_case(case_key: str) -> list[dict]:
     ok, _ = db_ready()
     if not ok:
@@ -866,13 +941,13 @@ def get_hotels_by_case(case_key: str) -> list[dict]:
             cur.execute(
                 """
                 SELECT case_key, source, destination, hotel_name, hotel_name_norm, address, address_norm,
-                       star_num, score_text, price_vnd_num, hotel_link
+                       star_num, score_text, price_vnd_num, hotel_link, raw_json
                 FROM hotel_snapshot
                 WHERE case_key = %s
                 """,
                 (case_key,),
             )
-            return [dict(row) for row in cur.fetchall()]
+            return [_enrich_snapshot_row_for_compare(dict(row)) for row in cur.fetchall()]
     finally:
         conn.close()
 
@@ -916,6 +991,12 @@ def _sim(a: str, b: str) -> float:
 
 # Điểm dưới ngưỡng → không coi là match (tránh ghép sai như Paris ↔ HERO Hostel).
 MIN_CROSS_CHANNEL_MATCH_SCORE = 0.62
+
+# So khớp theo tọa độ khi cả hai kênh (không dùng cặp ID Agoda–Travel) đều có lat/lng.
+GEO_MATCH_MAX_M = 50.0
+SRC_AGODA = "Agoda"
+SRC_TRAVEL = "Travel.com.vn"
+ID_AGODA_TRAVEL_MATCH_SCORE = 1.0
 
 
 def _name_pair_score(na: str, nb: str) -> float:
@@ -971,32 +1052,70 @@ def pair_score(base: dict, cand: dict) -> float:
     return max(0.0, min(1.0, total))
 
 
+def cross_pair_score_and_tag(base: dict, cand: dict) -> tuple[float, str]:
+    """
+    Ghép đa kênh:
+    - Agoda ↔ Travel.com.vn: cùng Mã Property Agoda (Travel lưu ID Agoda liên kết ở cột đó).
+    - Các cặp khác: nếu cả hai có GEO → chỉ xét cặp trong sai số GEO_MATCH_MAX_M (mặc định 50m),
+      điểm ghép chủ yếu theo tên (+ sao nhẹ).
+    - Thiếu tọa độ một/bên: giữ logic cũ (tên + địa chỉ).
+    """
+    sa = (base.get("source") or "").strip()
+    sb = (cand.get("source") or "").strip()
+
+    if {sa, sb} == {SRC_AGODA, SRC_TRAVEL}:
+        row_agoda = base if sa == SRC_AGODA else cand
+        row_travel = cand if sa == SRC_AGODA else base
+        id_agoda = (row_agoda.get("cmp_agoda_id") or "").strip()
+        id_on_travel = (row_travel.get("cmp_agoda_id") or "").strip()
+        if id_agoda and id_on_travel and id_agoda == id_on_travel:
+            return (ID_AGODA_TRAVEL_MATCH_SCORE, "ID Agoda–Travel")
+
+    la1, lo1 = base.get("cmp_lat"), base.get("cmp_lng")
+    la2, lo2 = cand.get("cmp_lat"), cand.get("cmp_lng")
+    if _coords_valid(la1, lo1) and _coords_valid(la2, lo2):
+        dist = _haversine_m(la1, lo1, la2, lo2)
+        if dist > GEO_MATCH_MAX_M:
+            return (0.0, f">{GEO_MATCH_MAX_M:.0f}m")
+        name_sc = _name_pair_score(
+            base.get("hotel_name_norm", ""), cand.get("hotel_name_norm", "")
+        )
+        addr_sc = _sim(base.get("address_norm", ""), cand.get("address_norm", ""))
+        total = 0.92 * name_sc + 0.08 * max(addr_sc, 0.0)
+        total += _star_bonus(base.get("star_num"), cand.get("star_num"))
+        total = max(0.0, min(1.0, total))
+        return (total, f"GEO≤{GEO_MATCH_MAX_M:.0f}m+tên")
+
+    sc = pair_score(base, cand)
+    return (sc, "Tên+địa chỉ")
+
+
 def _greedy_one_to_one(
     base_rows: list[dict],
     cand_rows: list[dict],
     min_score: float,
-) -> tuple[dict[int, tuple[dict, float]], set[int]]:
+) -> tuple[dict[int, tuple[dict, float, str]], set[int]]:
     """
     Mỗi khách sạn phía candidate chỉ gán cho tối đa một dòng base (tránh iVIVU bị lặp cho nhiều Agoda).
     Duyệt cạnh theo điểm giảm dần, bỏ qua nếu đã khớp.
     """
-    edges: list[tuple[float, int, int]] = []
+    edges: list[tuple[float, int, int, str]] = []
     for i, b in enumerate(base_rows):
         for j, c in enumerate(cand_rows):
-            sc = pair_score(b, c)
-            edges.append((sc, i, j))
+            sc, tag = cross_pair_score_and_tag(b, c)
+            edges.append((sc, i, j, tag))
     edges.sort(key=lambda x: x[0], reverse=True)
     used_b: set[int] = set()
     used_c: set[int] = set()
-    out: dict[int, tuple[dict, float]] = {}
-    for sc, i, j in edges:
+    out: dict[int, tuple[dict, float, str]] = {}
+    for sc, i, j, tag in edges:
         if sc < min_score:
             break
         if i in used_b or j in used_c:
             continue
         used_b.add(i)
         used_c.add(j)
-        out[i] = (cand_rows[j], sc)
+        out[i] = (cand_rows[j], sc, tag)
     return out, used_c
 
 
@@ -1028,7 +1147,7 @@ def build_cross_channel_compare(case_key: str) -> list[dict]:
     base_rows = by_source[base_source]
 
     # Gán 1–1 giữa base và từng nguồn khác (mỗi KS phía đối chỉ dùng một lần).
-    assign_per_src: dict[str, dict[int, tuple[dict, float]]] = {}
+    assign_per_src: dict[str, dict[int, tuple[dict, float, str]]] = {}
     used_cand_per_src: dict[str, set[int]] = {}
     for src in available:
         if src == base_source:
@@ -1064,13 +1183,15 @@ def build_cross_channel_compare(case_key: str) -> list[dict]:
                 continue
             best = None
             best_sc = -1.0
+            match_tag = ""
             pair = assign_per_src.get(src, {}).get(idx)
             if pair:
-                best, best_sc = pair
+                best, best_sc, match_tag = pair
             match_name = best.get("hotel_name", "") if best else ""
             match_price = best.get("price_vnd_num") if best else None
             out[f"Match {src}"] = match_name
             out[f"Score {src}"] = f"{best_sc * 100:.0f}" if best and best_sc >= MIN_CROSS_CHANNEL_MATCH_SCORE else ""
+            out[f"Cách ghép {src}"] = match_tag if best else ""
             out[f"Giá {src}"] = int(match_price) if isinstance(match_price, (int, float)) else ""
 
             if isinstance(match_price, (int, float)) and match_price > 0:
@@ -1127,6 +1248,7 @@ def build_cross_channel_compare(case_key: str) -> list[dict]:
                 if s != base_source:
                     out[f"Match {s}"] = ""
                     out[f"Score {s}"] = ""
+                    out[f"Cách ghép {s}"] = ""
                     out[f"Chênh {s} vs {base_source} (%)"] = ""
             out[f"Giá {src}"] = int(c_price) if isinstance(c_price, (int, float)) else ""
             out[f"Match {src}"] = c.get("hotel_name", "")
@@ -1141,7 +1263,10 @@ def build_cross_channel_compare(case_key: str) -> list[dict]:
             else:
                 out["Kênh rẻ nhất"] = ""
                 out["Giá rẻ nhất"] = ""
-            out["Ghi chú"] = f"Chỉ có trên {src} (chưa cross-match với {base_source}; có thể do tên khác hoặc dưới ngưỡng {MIN_CROSS_CHANNEL_MATCH_SCORE:.0%})"
+            out["Ghi chú"] = (
+                f"Chỉ có trên {src} (chưa ghép với {base_source}: xa >{GEO_MATCH_MAX_M:.0f}m, "
+                f"không khớp ID Agoda–Travel, hoặc điểm tên < {MIN_CROSS_CHANNEL_MATCH_SCORE:.0%})"
+            )
             result.append(out)
 
     return result
