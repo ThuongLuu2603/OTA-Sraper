@@ -27,6 +27,26 @@ from market_db import (
     delete_tour_case_source,
 )
 
+# openpyxl từ chối một số ký tự điều khiển XML 1.0 (vd. \x08 trong tên KS từ iVIVU).
+_EXCEL_ILLEGAL_STR = re.compile(r"[\000-\010]|[\013-\014]|[\016-\037]")
+
+
+def _sanitize_str_for_openpyxl(val):
+    if not isinstance(val, str):
+        return val
+    return _EXCEL_ILLEGAL_STR.sub("", val)
+
+
+def _sanitize_df_for_openpyxl(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if out[c].dtype == object or pd.api.types.is_string_dtype(out[c]):
+            out[c] = out[c].apply(
+                lambda x: _sanitize_str_for_openpyxl(x) if isinstance(x, str) else x
+            )
+    return out
+
+
 st.set_page_config(
     page_title="OTA Hotel Scraper",
     page_icon="🏨",
@@ -137,11 +157,17 @@ _HOTEL_ID_GEO_KEYS = frozenset(
     {"Mã Property Agoda", "ID khách sạn Travel", "Mã property (OTA)", "Vĩ độ", "Kinh độ"}
 )
 
+# Cột chỉ hiện trên một số OTA (vd. badge promo 2N1Đ | giá trên card iVIVU).
+_HOTEL_COLS_ONLY_FOR_SOURCES: dict[str, frozenset[str]] = {
+    "Nhãn badge": frozenset({"iVIVU"}),
+}
+
 HOTEL_RESULT_COLUMNS = [
     "Phân khúc",
     "Nguồn",
     "Tỉnh thành / Điểm đến",
     "Tên khách sạn",
+    "Nhãn badge",
     "Địa chỉ",
     "Mã Property Agoda",
     "ID khách sạn Travel",
@@ -171,7 +197,14 @@ def hotel_table_column_order(source: str) -> list[str]:
         "Travel.com.vn": {"Mã Property Agoda", "ID khách sạn Travel", "Vĩ độ", "Kinh độ"},
     }
     ks = keep.get(source, {"Vĩ độ", "Kinh độ"})
-    return [c for c in HOTEL_RESULT_COLUMNS if c not in _HOTEL_ID_GEO_KEYS or c in ks]
+    out: list[str] = []
+    for c in HOTEL_RESULT_COLUMNS:
+        allowed = _HOTEL_COLS_ONLY_FOR_SOURCES.get(c)
+        if allowed is not None and source not in allowed:
+            continue
+        if c not in _HOTEL_ID_GEO_KEYS or c in ks:
+            out.append(c)
+    return out
 
 
 TOUR_RESULT_COLUMNS = [
@@ -215,6 +248,7 @@ def normalize_hotel_rows(rows: list, source: str, destination: str) -> list:
             "Nguồn": source,
             "Tỉnh thành / Điểm đến": _pick_text(row, "Tỉnh thành / Điểm đến", "Tỉnh/Thành") or destination,
             "Tên khách sạn": _pick_text(row, "Tên khách sạn"),
+            "Nhãn badge": _pick_text(row, "Nhãn badge", "Taf"),
             "Địa chỉ": _pick_text(row, "Địa chỉ", "Địa điểm nổi bật"),
             "Mã Property Agoda": _pick_text(row, "Mã Property Agoda"),
             "ID khách sạn Travel": _pick_text(row, "ID khách sạn Travel"),
@@ -1503,7 +1537,9 @@ if segment_name == "Hotel" and compare_tool_mode:
                     with c1:
                         out_cmp = io.BytesIO()
                         with pd.ExcelWriter(out_cmp, engine="openpyxl") as writer:
-                            gdf.to_excel(writer, index=False, sheet_name="SoSanhDaKenh")
+                            _sanitize_df_for_openpyxl(gdf).to_excel(
+                                writer, index=False, sheet_name="SoSanhDaKenh"
+                            )
                         out_cmp.seek(0)
                         st.download_button(
                             label="📊 Tải Excel so sánh",
@@ -1933,6 +1969,9 @@ if (not compare_tool_mode) and st.session_state.scrape_results:
             "Nguồn": st.column_config.TextColumn("🌐 Nguồn", width="small"),
             "Tỉnh thành / Điểm đến": st.column_config.TextColumn("📍 Điểm đến", width="small"),
             "Tên khách sạn": st.column_config.TextColumn("🏨 Tên khách sạn", width="large"),
+            "Nhãn badge": st.column_config.TextColumn(
+                "🏷️ Nhãn badge", width="large", help="VD: 2N1Đ Xe + Ăn sáng | 1tr099"
+            ),
             "Địa chỉ": st.column_config.TextColumn("📌 Địa chỉ", width="large"),
             "Mã Property Agoda": st.column_config.TextColumn("🔑 Agoda ID", width="small"),
             "ID khách sạn Travel": st.column_config.TextColumn("🆔 Travel ID", width="small"),
@@ -1970,7 +2009,7 @@ if (not compare_tool_mode) and st.session_state.scrape_results:
         sheet = f"{active_source} - {active_destination}"[:31]
         df_xlsx = df[hotel_display_cols] if active_segment == "Hotel" else df
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df_xlsx.to_excel(writer, index=False, sheet_name=sheet)
+            _sanitize_df_for_openpyxl(df_xlsx).to_excel(writer, index=False, sheet_name=sheet)
             ws = writer.sheets[sheet]
             widths = [18, 45, 35, 45, 12, 18, 18, 14, 18, 20, 35, 55]
             from openpyxl.utils import get_column_letter

@@ -225,10 +225,305 @@ def _ivivu_property_id(item: dict) -> str:
     return ""
 
 
+_IVIVU_EXCEL_ILLEGAL = re.compile(r"[\000-\010]|[\013-\014]|[\016-\037]")
+
+
+def _ivivu_clean_taf_text(s: str, max_len: int = 500) -> str:
+    t = _IVIVU_EXCEL_ILLEGAL.sub("", (s or "").strip())
+    t = re.sub(r"\s+", " ", t)
+    return t[:max_len] if len(t) > max_len else t
+
+
+# Không dùng "nghỉ dưỡng" đơn lẻ — trùng tên KS ("Khu Nghỉ Dưỡng …") gây nhầm thành ribbon.
+_IVIVU_MARKETING_RIBBON = re.compile(
+    r"ưu\s*đãi|khuyến\s*mãi|đặc\s*biệt|trọn\s*gói|flash\s*sale|"
+    r"dành\s*cho\s*khách|áp\s*dụng\s*cho|expats|miễn\s*phí\s*hủy|"
+    r"combo\s*fantastic|nghỉ\s*dưỡng\s+trọn|ưu\s*đãi\s+.*nghỉ|"
+    r"đặt\s*trước|quốc\s*tịch|tất\s*cả\s*quốc",
+    re.I,
+)
+
+
+def _ivivu_text_looks_like_marketing_ribbon(s: str) -> bool:
+    """Dòng marketing trên ribbon (vd. Ưu Đãi Đặc Biệt (Áp dụng cho…))."""
+    if not s or len(s) > 320:
+        return False
+    return bool(_IVIVU_MARKETING_RIBBON.search(s))
+
+
+def _ivivu_text_looks_like_promo_badge(s: str) -> bool:
+    """Có mẫu gói đêm kiểu 2N1Đ — không phải tag địa điểm/tiện ích."""
+    if not s or len(s) > 220:
+        return False
+    if re.search(r"\d+\s*[Nn]\s*\d+\s*[Đđ]", s):
+        return True
+    return bool(re.search(r"(?<![A-Za-zÀ-ỹ])\d+\s*[Nn]\s*\d+\s*D(?:\s|[+|]|$)", s))
+
+
+def _ivivu_text_same_as_hotel_name(s: str, hotel_name: str) -> bool:
+    """Trùng tên KS (sau chuẩn hóa khoảng trắng) — không dùng 'substring' để tránh loại nhầm ribbon dài."""
+    if not s or not hotel_name:
+        return False
+    a = re.sub(r"\s+", " ", s.strip().lower())
+    b = re.sub(r"\s+", " ", hotel_name.strip().lower())
+    return a == b
+
+
+def _ivivu_text_looks_like_amenity_location_chip(s: str) -> bool:
+    """Chip xám địa điểm/tiện ích (vd. Bãi Sau | Xe đưa đón) — không phải ribbon promo."""
+    if not s or len(s) > 200:
+        return False
+    if _ivivu_text_looks_like_marketing_ribbon(s) or _ivivu_text_looks_like_promo_badge(s):
+        return False
+    t = s.lower()
+    if "|" not in s:
+        return False
+    markers = (
+        "bãi sau",
+        "bãi trước",
+        "trung tâm",
+        "gần biển",
+        "xe đưa đón",
+        "chợ đêm",
+        "chợ hải sản",
+        "ga tàu",
+        "sân bay",
+        "nhà hàng",
+        "hồ bơi",
+        "view biển",
+    )
+    return any(m in t for m in markers)
+
+
+def _ivivu_string_to_badge(s: str) -> str:
+    """Gộp nhận diện gói đêm + dòng marketing; lọc chip tiện ích."""
+    t = _ivivu_clean_taf_text(s, max_len=900)
+    if not t or _ivivu_text_looks_like_amenity_location_chip(t):
+        return ""
+    combo = _ivivu_slice_combo_badge(t)
+    if combo and (
+        _ivivu_text_looks_like_marketing_ribbon(t)
+        or len(t) > len(combo) + 8
+    ):
+        return t[:900]
+    if combo:
+        return combo
+    if _ivivu_text_looks_like_marketing_ribbon(t) or _ivivu_text_looks_like_promo_badge(t):
+        return t[:900]
+    return ""
+
+
+def _ivivu_slice_combo_badge(s: str) -> str:
+    """
+    Cắt đúng đoạn badge promo: từ 2N1Đ… tới tối đa 2 nhánh | (thường là giá 1tr099 / 750k).
+    Không lấy chuỗi chỉ có 'Bãi Sau | Xe đưa đón…' (không có NĐêm).
+    """
+    t = _ivivu_clean_taf_text(s)
+    if not t:
+        return ""
+    # Tối đa một dấu | phía sau (tên gói | giá); tránh nuốt chữ nối sau giá.
+    m = re.search(
+        r"(\d+\s*[Nn]\s*\d+\s*[Đđ][^|]{0,130}(?:\|[^|]{0,28})?)",
+        t,
+    )
+    if m:
+        return m.group(1).strip()[:220]
+    m = re.search(
+        r"(\d+\s*[Nn]\s*\d+\s*D[^|]{0,130}(?:\|[^|]{0,28})?)",
+        t,
+        re.I,
+    )
+    if m:
+        return m.group(1).strip()[:220]
+    return ""
+
+
+def _ivivu_deep_find_badget_json(obj, depth: int = 0, max_d: int = 6) -> str:
+    """
+    iVIVU dùng typo 'badget' trong class DOM (pdv__badget-text); JSON có thể có key tương tự.
+    """
+    if depth > max_d:
+        return ""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kn = str(k).lower().replace("_", "")
+            if "badget" in kn:
+                if isinstance(v, str):
+                    t = _ivivu_clean_taf_text(v, max_len=900)
+                    if t and not _ivivu_text_looks_like_amenity_location_chip(t):
+                        got = _ivivu_string_to_badge(t)
+                        if got:
+                            return got[:900]
+                        if _ivivu_text_looks_like_marketing_ribbon(t) or _ivivu_text_looks_like_promo_badge(
+                            t
+                        ):
+                            return t[:900]
+                elif isinstance(v, (dict, list)):
+                    got = _ivivu_badge_from_value(v)
+                    if got:
+                        return got
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                got = _ivivu_deep_find_badget_json(v, depth + 1, max_d)
+                if got:
+                    return got
+    elif isinstance(obj, list):
+        for it in obj[:40]:
+            if isinstance(it, (dict, list)):
+                got = _ivivu_deep_find_badget_json(it, depth + 1, max_d)
+                if got:
+                    return got
+    return ""
+
+
+def _ivivu_badge_from_value(val) -> str:
+    """Trích badge từ string / dict / list — gói đêm 2N1Đ hoặc dòng marketing ribbon."""
+    if isinstance(val, str):
+        return _ivivu_string_to_badge(val)
+    if isinstance(val, dict):
+        for kk in (
+            "title",
+            "name",
+            "text",
+            "label",
+            "taf",
+            "description",
+            "content",
+            "promotionLabel",
+            "dealText",
+        ):
+            raw = str(val.get(kk) or "")
+            got = _ivivu_string_to_badge(raw)
+            if got:
+                return got
+    if isinstance(val, list):
+        for el in val[:12]:
+            if isinstance(el, str):
+                got = _ivivu_string_to_badge(el)
+                if got:
+                    return got
+            elif isinstance(el, dict):
+                got = _ivivu_badge_from_value(el)
+                if got:
+                    return got
+    return ""
+
+
+def _ivivu_extract_badge_label(item: dict) -> str:
+    """
+    Mọi ribbon / nhãn promo trên card (DOM pdv__badget-text và tương tự):
+    vd. 2N1Đ … | 1tr099, Ưu Đãi Đặc Biệt (…), Ưu Đãi Nghỉ Dưỡng Trọn Gói (…).
+    Không lấy chip xám tiện ích/địa điểm (Bãi Sau | …) khi suy từ JSON.
+    """
+    if not isinstance(item, dict):
+        return ""
+    hotel_name = (item.get("hotelName") or "").strip()
+
+    def _ok_badge(got: str) -> bool:
+        return bool(got) and not _ivivu_text_same_as_hotel_name(got, hotel_name)
+
+    dom_inj = item.get("_ivivuPdvBadgetDom")
+    if isinstance(dom_inj, str) and dom_inj.strip():
+        parts = [p.strip() for p in re.split(r"\s*•\s*", dom_inj) if p.strip()]
+        kept = [
+            p
+            for p in parts
+            if not _ivivu_text_looks_like_amenity_location_chip(p)
+            and not _ivivu_text_same_as_hotel_name(p, hotel_name)
+        ]
+        merged = " • ".join(kept) if kept else ""
+        if not merged:
+            raw_one = _ivivu_clean_taf_text(dom_inj, max_len=900).strip()
+            if raw_one and not _ivivu_text_same_as_hotel_name(raw_one, hotel_name):
+                merged = raw_one
+        if merged:
+            return _ivivu_clean_taf_text(merged, max_len=900)[:900]
+
+    cmap = {str(k).lower().replace("_", ""): v for k, v in item.items()}
+
+    for dk in ("pdvbadgettext", "badgettext", "packagebadget", "hotelbadget"):
+        v = cmap.get(dk)
+        if isinstance(v, str) and v.strip():
+            got = _ivivu_string_to_badge(v)
+            if not got:
+                t = _ivivu_clean_taf_text(v, max_len=900).strip()
+                if t and (
+                    _ivivu_text_looks_like_marketing_ribbon(t)
+                    or _ivivu_text_looks_like_promo_badge(t)
+                ):
+                    got = t
+            if _ok_badge(got):
+                return got[:900]
+
+    got_deep = _ivivu_deep_find_badget_json(item)
+    if _ok_badge(got_deep):
+        return got_deep[:900]
+
+    direct_keys = (
+        "taf",
+        "taftext",
+        "badge",
+        "badgetext",
+        "badgelabel",
+        "promotionlabel",
+        "promolabel",
+        "dealtag",
+        "combolabel",
+        "packagelabel",
+        "packagename",
+        "flashsalelabel",
+        "ribbontext",
+        "shortpromo",
+        "promotiontitle",
+        "offername",
+        "salelabel",
+        "productlabel",
+    )
+    for dk in direct_keys:
+        got = _ivivu_badge_from_value(cmap.get(dk))
+        if _ok_badge(got):
+            return got
+
+    # Không đọc labels / tags / badges / hotelBadges — thường là tiện ích khu vực, không phải 2N1Đ.
+    for nest in (
+        "promotion",
+        "promotions",
+        "deal",
+        "package",
+        "combo",
+        "offer",
+        "flashsale",
+    ):
+        sub = item.get(nest)
+        if sub is None:
+            continue
+        got = _ivivu_badge_from_value(sub)
+        if _ok_badge(got):
+            return got
+
+    for _k, v in item.items():
+        kn = str(_k).lower().replace("_", "")
+        if kn in ("hotelname", "hotelnameslug", "slug", "address", "description"):
+            continue
+        if isinstance(v, str):
+            if _ivivu_text_same_as_hotel_name(v, hotel_name):
+                continue
+            got = _ivivu_string_to_badge(v)
+            if _ok_badge(got):
+                return got
+        elif isinstance(v, (list, dict)):
+            got = _ivivu_badge_from_value(v)
+            if _ok_badge(got):
+                return got
+
+    return ""
+
+
 def _parse_hotel(item: dict, destination: str) -> dict:
     lat_s, lng_s = _ivivu_lat_lng(item)
     return {
         "Tên khách sạn": item.get("hotelName", "").strip(),
+        "Nhãn badge": _ivivu_extract_badge_label(item),
         "Link khách sạn": _full_url(item.get("hotelLink") or item.get("url") or ""),
         "Địa chỉ": (item.get("address") or "").strip(),
         "Hạng sao": _fmt_stars(item.get("rating")),
@@ -284,6 +579,142 @@ async def _capture_search_context(url: str, status_callback):
             if "body" in captured:
                 break
             await asyncio.sleep(0.5)
+
+        # Ribbon / nhãn promo trên từng card (2N1Đ, Ưu Đãi…), gom nhiều span / card bằng " • ".
+        if "body" in captured:
+            dom_texts: list[str] = []
+            for _ in range(4):
+                try:
+                    dom_texts = await page.evaluate(
+                        """() => {
+                            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                            /* Trong cùng card có nhiều ribbon (Ưu Đãi Đặc Biệt, Đặt Trước 5 Ngày…) — class có thể khác badget-text */
+                            const strictSels = [
+                                '.pdv__badget-text',
+                                "[class*='pdv__badget-text']",
+                                "[class*='badget-text']",
+                                "[class*='badge-text']",
+                            ];
+                            /* Chỉ dùng trong <a> có ảnh KS — tránh link tiêu đề (nuốt tên KS) */
+                            const overlaySels = [
+                                "[class*='ribbon']",
+                                "[class*='pdv__ribbon']",
+                                "[class*='pdv__sale']",
+                                "[class*='pdv__promo']",
+                                "[class*='promo-tag']",
+                                "[class*='tag-promo']",
+                                "[class*='promo-label']",
+                                "[class*='offer-tag']",
+                                "[class*='discount-tag']",
+                                "[class*='label--promo']",
+                                "[class*='uu-dai']",
+                            ];
+                            function findCardRoot(node) {
+                                let el = node;
+                                for (let i = 0; i < 14 && el; i++) {
+                                    if (!el || el === document.body) return null;
+                                    const cls = typeof el.className === 'string' ? el.className : '';
+                                    const tag = (el.tagName || '').toUpperCase();
+                                    if (tag === 'LI' || tag === 'ARTICLE') return el;
+                                    if (cls.includes('hotel') && (cls.includes('item') || cls.includes('card') || cls.includes('product'))) return el;
+                                    if (cls.includes('product-item') || cls.includes('search-item') || cls.includes('result-item')) return el;
+                                    if (cls.includes('pdv') && (cls.includes('item') || cls.includes('row') || cls.includes('block'))) return el;
+                                    el = el.parentElement;
+                                }
+                                return null;
+                            }
+                            function imageLinkScopesInCard(root) {
+                                const scopes = [];
+                                const seen = new WeakSet();
+                                root.querySelectorAll('a[href*="/khach-san/"]').forEach((L) => {
+                                    if (!L.querySelector('img')) return;
+                                    if (seen.has(L)) return;
+                                    seen.add(L);
+                                    scopes.push(L);
+                                });
+                                return scopes;
+                            }
+                            function finalizeRibbonNodes(nodes) {
+                                nodes.sort((a, b) => {
+                                    const pos = a.compareDocumentPosition(b);
+                                    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                                    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                                    return 0;
+                                });
+                                const seen = new Set();
+                                const parts = [];
+                                for (const el of nodes) {
+                                    const t = norm(el.textContent);
+                                    if (t.length < 3 || t.length > 320) continue;
+                                    if (seen.has(t)) continue;
+                                    seen.add(t);
+                                    parts.push(t);
+                                }
+                                return parts.join(' • ');
+                            }
+                            function collectFromRoot(root) {
+                                const linkScopes = imageLinkScopesInCard(root);
+                                const nodes = [];
+                                const addAll = (scope, selStr) => {
+                                    try {
+                                        scope.querySelectorAll(selStr).forEach((el) => nodes.push(el));
+                                    } catch (e) {}
+                                };
+                                if (linkScopes.length) {
+                                    for (const scope of linkScopes) {
+                                        strictSels.forEach((s) => addAll(scope, s));
+                                        overlaySels.forEach((s) => addAll(scope, s));
+                                    }
+                                } else {
+                                    const scope = root;
+                                    strictSels.forEach((s) => addAll(scope, s));
+                                }
+                                return finalizeRibbonNodes(nodes);
+                            }
+                            const rootsOrdered = [];
+                            const seenRoot = new WeakSet();
+                            function pushRoot(r) {
+                                if (!r || seenRoot.has(r)) return;
+                                seenRoot.add(r);
+                                rootsOrdered.push(r);
+                            }
+                            document.querySelectorAll('a[href*="/khach-san/"]').forEach((a) => {
+                                const href = a.getAttribute('href') || '';
+                                if (href.length < 12) return;
+                                const root = findCardRoot(a) || a.closest('li') || a.closest('[class*="item"]');
+                                if (root) pushRoot(root);
+                            });
+                            if (rootsOrdered.length >= 3) {
+                                rootsOrdered.sort((a, b) => {
+                                    const ra = a.getBoundingClientRect();
+                                    const rb = b.getBoundingClientRect();
+                                    return ra.top - rb.top || ra.left - rb.left;
+                                });
+                                return rootsOrdered.map((root) => collectFromRoot(root));
+                            }
+                            const flat = [];
+                            document.querySelectorAll('a[href*="/khach-san/"]').forEach((a) => {
+                                if (!a.querySelector('img')) return;
+                                const nodes = [];
+                                const addAll = (selStr) => {
+                                    try {
+                                        a.querySelectorAll(selStr).forEach((el) => nodes.push(el));
+                                    } catch (e) {}
+                                };
+                                strictSels.forEach((s) => addAll(s));
+                                overlaySels.forEach((s) => addAll(s));
+                                const joined = finalizeRibbonNodes(nodes);
+                                if (joined) flat.push(joined);
+                            });
+                            return flat;
+                        }"""
+                    )
+                except Exception:
+                    dom_texts = []
+                if isinstance(dom_texts, list) and dom_texts:
+                    break
+                await asyncio.sleep(0.9)
+            captured["dom_badget_texts"] = dom_texts if isinstance(dom_texts, list) else []
 
         await browser.close()
     return captured if "body" in captured else None
@@ -358,8 +789,34 @@ async def _scrape_async(
 
     status_callback(f"📊 iVIVU: tổng ~{total_hotels or '?'} khách sạn, {total_pages} trang")
 
-    add_items(first_items if isinstance(first_items, list) else [])
-    status_callback(f"📄 Trang 1/{total_pages}: +{len(first_items) if isinstance(first_items, list) else 0} raw (tổng: {len(results)})")
+    if not isinstance(first_items, list):
+        first_items = []
+    dom_bg = ctx.get("dom_badget_texts") or []
+    if dom_bg and first_items:
+        merged: list = []
+        for i, it in enumerate(first_items):
+            if isinstance(it, dict):
+                d = dict(it)
+                if i < len(dom_bg):
+                    raw = str(dom_bg[i] or "").strip()
+                    if raw:
+                        cleaned = _ivivu_clean_taf_text(raw, max_len=900)
+                        hn = (d.get("hotelName") or "").strip()
+                        if not _ivivu_text_same_as_hotel_name(cleaned, hn):
+                            d["_ivivuPdvBadgetDom"] = cleaned
+                merged.append(d)
+            else:
+                merged.append(it)
+        first_items = merged
+        status_callback(
+            f"ℹ️ iVIVU: nhãn ribbon (card DOM) — {len(dom_bg)} ô, "
+            f"ghép thứ tự với {len(first_items)} KS trang 1."
+        )
+    elif dom_bg and not first_items:
+        status_callback(f"ℹ️ iVIVU: có {len(dom_bg)} ribbon DOM nhưng API trang 1 rỗng.")
+
+    add_items(first_items)
+    status_callback(f"📄 Trang 1/{total_pages}: +{len(first_items)} raw (tổng: {len(results)})")
 
     consecutive_empty = 0
     for pg in range(2, total_pages + 1):
