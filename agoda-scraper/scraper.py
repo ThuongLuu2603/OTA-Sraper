@@ -1,4 +1,5 @@
 import asyncio
+import os
 import random
 import re
 import time
@@ -6,8 +7,10 @@ import shutil
 import urllib.request
 import json
 import sys
+import unicodedata
+from collections import Counter
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote_plus, urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_bootstrap import ensure_playwright_chromium
 from geo_extract import scan_json_for_latlng
@@ -227,26 +230,281 @@ def _extract_properties_from_city_search(city_search: dict) -> list[dict]:
     return result
 
 
-def _collect_prices(hotel: dict) -> list[dict]:
-    """
-    Collect all (exclusive, inclusive, currency) price entries from all offers.
-    Returns list of dicts sorted by exclusive price ascending (cheapest first).
-    """
-    entries = []
+def _price_display_to_float(v) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    s = str(v).strip().replace(",", "")
     try:
-        offers = _safe_get(hotel, "pricing", "offers", default=[])
-        for offer in offers:
-            for ro in offer.get("roomOffers", []):
-                for pe in _safe_get(ro, "room", "pricing", default=[]):
-                    currency = pe.get("currency", "USD")
-                    excl = _safe_get(pe, "price", "perNight", "exclusive", "display")
-                    incl = _safe_get(pe, "price", "perNight", "inclusive", "display")
-                    if excl is not None:
-                        entries.append({"currency": currency, "excl": excl, "incl": incl or excl})
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _per_night_side_amount(pn: dict, side: str) -> float | None:
+    """Lấy số từ perNight.exclusive|inclusive (display, amount, hoặc số thẳng)."""
+    if not isinstance(pn, dict):
+        return None
+    branch = pn.get(side)
+    if isinstance(branch, dict):
+        for k in ("display", "amount", "value", "raw"):
+            v = _price_display_to_float(branch.get(k))
+            if v is not None:
+                return v
+        return None
+    return _price_display_to_float(branch)
+
+
+def _append_per_night_entry(
+    entries: list[dict],
+    seen: set[tuple],
+    currency: str,
+    excl: float | None,
+    incl: float | None,
+) -> None:
+    if excl is None and incl is None:
+        return
+    if excl is None:
+        excl = incl
+    if incl is None:
+        incl = excl
+    cur = str(currency or "USD").strip().upper() or "USD"
+    key = (cur, round(float(incl), 2), round(float(excl), 2))
+    if key in seen:
+        return
+    seen.add(key)
+    entries.append({"currency": cur, "excl": float(excl), "incl": float(incl)})
+
+
+_SKIP_PER_NIGHT_WALK_KEYS = frozenset(
+    {
+        "reviews",
+        "review",
+        "guestReviews",
+        "reviewComments",
+        "qna",
+        "questionsAndAnswers",
+        "similarProperties",
+        "featuredComments",
+    }
+)
+
+
+def _looks_like_hotel_nightly_money(amount: float | None) -> bool:
+    if amount is None or amount != amount:  # NaN
+        return False
+    return 25_000 <= float(amount) <= 999_999_999
+
+
+def _walk_inclusive_exclusive_price_blocks(
+    node, entries: list[dict], seen: set[tuple], depth: int = 0
+) -> None:
+    """
+    Một số payload Agoda đặt giá list-card trong object có sẵn inclusive/exclusive (không bọc price.perNight).
+    """
+    if depth > 18:
+        return
+    if isinstance(node, dict):
+        inc_o = node.get("inclusive")
+        exc_o = node.get("exclusive")
+        if isinstance(inc_o, dict) and isinstance(exc_o, dict):
+            faux = {"inclusive": inc_o, "exclusive": exc_o}
+            incl = _per_night_side_amount(faux, "inclusive")
+            excl = _per_night_side_amount(faux, "exclusive")
+            if _looks_like_hotel_nightly_money(incl) or _looks_like_hotel_nightly_money(excl):
+                cur = node.get("currency") or node.get("currencyCode")
+                cur_s = str(cur).strip().upper() if cur else ""
+                if not cur_s or cur_s.isdigit():
+                    cur_s = "VND"
+                _append_per_night_entry(entries, seen, cur_s, excl, incl)
+        for k, v in node.items():
+            if isinstance(k, str) and k in _SKIP_PER_NIGHT_WALK_KEYS:
+                continue
+            _walk_inclusive_exclusive_price_blocks(v, entries, seen, depth + 1)
+    elif isinstance(node, list):
+        for it in node[:150]:
+            _walk_inclusive_exclusive_price_blocks(it, entries, seen, depth + 1)
+
+
+def _walk_collect_per_night_prices(node, entries: list[dict], seen: set[tuple], depth: int = 0) -> None:
+    """
+    Quét sâu toàn property: mọi dict có price.perNight (Agoda đặt giá list-card / room ở nhiều nhánh).
+    Không đọc price.total để tránh nhầm tổng kỳ với giá/đêm.
+    """
+    if depth > 18:
+        return
+    if isinstance(node, dict):
+        price = node.get("price")
+        if isinstance(price, dict) and isinstance(price.get("perNight"), dict):
+            pn = price["perNight"]
+            cur = node.get("currency") or price.get("currency") or "USD"
+            excl = _per_night_side_amount(pn, "exclusive")
+            incl = _per_night_side_amount(pn, "inclusive")
+            _append_per_night_entry(entries, seen, cur, excl, incl)
+        for k, v in node.items():
+            if isinstance(k, str) and k in _SKIP_PER_NIGHT_WALK_KEYS:
+                continue
+            _walk_collect_per_night_prices(v, entries, seen, depth + 1)
+    elif isinstance(node, list):
+        for it in node[:150]:
+            _walk_collect_per_night_prices(it, entries, seen, depth + 1)
+
+
+def _parse_json_display_money_vnd(s: str) -> float | None:
+    """Chuỗi kiểu '364,609 VND' / '1.458.437' trong JSON display."""
+    if not s:
+        return None
+    t = s.replace("\xa0", " ").strip()
+    t = re.sub(r"\s+VND\s*$", "", t, flags=re.I).strip()
+    if re.fullmatch(r"\d{1,3}(?:,\d{3})+", t):
+        v = float(t.replace(",", ""))
+    elif re.fullmatch(r"\d{1,3}(?:\.\d{3})+", t):
+        v = float(t.replace(".", ""))
+    else:
+        m = re.match(r"([\d]{1,3}(?:[.,]\d{3})+)", t)
+        if not m:
+            return None
+        num = m.group(1)
+        if "." in num and "," not in num:
+            v = float(num.replace(".", ""))
+        elif "," in num:
+            v = float(num.replace(",", ""))
+        else:
+            return None
+    return v if 80_000 <= v <= 99_000_000 else None
+
+
+def _mine_per_night_display_pairs_vnd(hotel: dict) -> list[tuple[float, float]]:
+    """
+    Gom mọi cặp (exclusive, inclusive) từ chuỗi display trong từng khối "perNight"
+    trên **toàn bộ** JSON property (promo thường nằm nhánh không được walker dict tới).
+    """
+    if not isinstance(hotel, dict):
+        return []
+    try:
+        s = json.dumps(hotel, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return []
+    max_l = 2_600_000
+    if len(s) > max_l:
+        s = s[:max_l]
+    pairs: list[tuple[float, float]] = []
+    start = 0
+    while True:
+        i = s.find('"perNight"', start)
+        if i < 0:
+            break
+        chunk = s[i : i + 8000]
+        im = re.search(
+            r'"inclusive"\s*:\s*\{.*?"display"\s*:\s*"([^"]+)"',
+            chunk,
+            re.I | re.DOTALL,
+        )
+        em = re.search(
+            r'"exclusive"\s*:\s*\{.*?"display"\s*:\s*"([^"]+)"',
+            chunk,
+            re.I | re.DOTALL,
+        )
+        inc = _parse_json_display_money_vnd(im.group(1)) if im else None
+        exc = _parse_json_display_money_vnd(em.group(1)) if em else None
+        if inc is None:
+            am_i = re.search(
+                r'"inclusive"\s*:\s*\{.*?"amount"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+                chunk,
+                re.I | re.DOTALL,
+            )
+            am_e = re.search(
+                r'"exclusive"\s*:\s*\{.*?"amount"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+                chunk,
+                re.I | re.DOTALL,
+            )
+            if not am_i:
+                am_i = re.search(
+                    r'"inclusive"\s*:\s*\{.*?"value"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+                    chunk,
+                    re.I | re.DOTALL,
+                )
+            if not am_e:
+                am_e = re.search(
+                    r'"exclusive"\s*:\s*\{.*?"value"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+                    chunk,
+                    re.I | re.DOTALL,
+                )
+            if am_i:
+                try:
+                    inc = float(am_i.group(1))
+                except ValueError:
+                    inc = None
+            if am_e:
+                try:
+                    exc = float(am_e.group(1))
+                except ValueError:
+                    pass
+        if inc is not None and 80_000 <= float(inc) <= 99_000_000:
+            exf = float(exc) if exc is not None else float(inc)
+            pairs.append((exf, float(inc)))
+        start = i + 12
+    return pairs
+
+
+def _filter_per_night_outliers(entries: list[dict]) -> list[dict]:
+    """
+    Bỏ các mức inclusive rõ ràng là rác parse (vd. ~104k khi cùng property có ~647k).
+    Không dùng ngưỡng tỷ lệ trên max (mx*0.18): sẽ xoá nhầm giá khuyến mãi thật (364k vs rack 2,5M).
+    """
+    if len(entries) < 2:
+        return entries
+    mx = max(e["incl"] for e in entries)
+    mn = min(e["incl"] for e in entries)
+    if mx <= 0 or mn <= 0:
+        return entries
+    if mx / mn < 4.5:
+        return entries
+    # Chỉ loại mức "vi mô" so với max; giá promo hợp lệ (thường > ~200k) không bị đụng.
+    kept = [
+        e
+        for e in entries
+        if not (
+            e["incl"] > 0
+            and e["incl"] < 220_000
+            and mx / e["incl"] > 5.0
+        )
+    ]
+    return kept if kept else entries
+
+
+def _collect_prices(hotel: dict, prefer_currency: str = "VND") -> list[dict]:
+    """
+    Quét toàn bộ node property (bỏ nhánh review) để gom mọi `price.perNight` trong GraphQL.
+    Một số payload chỉ đặt giá list-card / promo ở nhánh sâu, không chỉ `pricing`/`content`.
+    """
+    entries: list[dict] = []
+    seen: set[tuple] = set()
+    try:
+        if isinstance(hotel, dict):
+            _walk_collect_per_night_prices(hotel, entries, seen, 0)
+            _walk_inclusive_exclusive_price_blocks(hotel, entries, seen, 0)
+            for exc_m, inc_m in _mine_per_night_display_pairs_vnd(hotel):
+                _append_per_night_entry(entries, seen, "VND", exc_m, inc_m)
     except Exception:
         pass
-    # Sort by exclusive price ascending → cheapest first
-    entries.sort(key=lambda x: x["excl"])
+
+    if not entries:
+        return []
+
+    pref = (prefer_currency or "VND").strip().upper()
+    vnd_rows = [e for e in entries if e["currency"] == pref]
+    if vnd_rows:
+        entries = vnd_rows
+    else:
+        dom = Counter(e["currency"] for e in entries).most_common(1)
+        if dom:
+            c0 = dom[0][0]
+            entries = [e for e in entries if e["currency"] == c0]
+
+    entries = _filter_per_night_outliers(entries)
+    entries.sort(key=lambda x: (x["incl"], x["excl"]))
     return entries
 
 
@@ -257,8 +515,514 @@ def _format_price(amount: float, currency: str) -> str:
     return f"{amount:,.2f} {currency}"
 
 
+def _parse_agoda_price_amount_vnd(text: str) -> float | None:
+    """Parse số từ chuỗi kiểu '680,867 VND' hoặc '364.609 đ' (VN dùng . phân cách nghìn)."""
+    if not text:
+        return None
+    t = text.replace("\xa0", " ").strip()
+    m = re.search(r"([\d][\d.,\s]*)\s*(?:VND|đ|₫)", t, re.I)
+    if not m:
+        return None
+    num = m.group(1).replace(" ", "")
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", num):
+        num = num.replace(".", "")
+    elif re.fullmatch(r"\d{1,3}(?:,\d{3})+", num):
+        num = num.replace(",", "")
+    else:
+        num = num.replace(",", "").replace(".", "")
+    try:
+        v = float(num)
+        return v if v >= 10_000 else None
+    except ValueError:
+        return None
+
+
+def _agoda_search_hotel_name_filter(url: str) -> str:
+    """Giá trị query hotelName= khi user lọc tìm 1 khách sạn (URL của bạn có tham số này)."""
+    try:
+        q = parse_qs(urlparse(url).query)
+        for key in ("hotelName", "hotelname"):
+            vals = q.get(key)
+            if vals and vals[0]:
+                return unquote_plus(vals[0]).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _norm_hotel_filter_text(s: str) -> str:
+    if not s:
+        return ""
+    t = unicodedata.normalize("NFKD", s)
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = t.lower()
+    for ch in ".,'()/-":
+        t = t.replace(ch, " ")
+    return " ".join(t.split())
+
+
+def _card_text_matches_hotel_filter(card_norm: str, filt_norm: str) -> bool:
+    if not filt_norm or not card_norm:
+        return False
+    if filt_norm in card_norm:
+        return True
+    parts = [p for p in filt_norm.split() if len(p) > 2]
+    if not parts:
+        return filt_norm in card_norm
+    return all(p in card_norm for p in parts)
+
+
+def _hotel_name_matches_search_filter(display_name: str, filter_raw: str) -> bool:
+    """Khớp tên dòng GraphQL với hotelName= trên URL (hai chiều, có chuẩn hoá dấu)."""
+    a = _norm_hotel_filter_text(display_name)
+    b = _norm_hotel_filter_text(filter_raw)
+    if not a or not b:
+        return False
+    return _card_text_matches_hotel_filter(a, b) or _card_text_matches_hotel_filter(b, a)
+
+
+async def _agoda_ui_price_for_name_filter(page, filter_raw: str) -> float | None:
+    """
+    Khi URL có hotelName=, lấy giá trên thẻ có nội dung khớp tên (không phụ thuộc map property id).
+    Khớp tên trên **toàn bộ** innerText thẻ (1200 ký tự đầu thường không chứa tên KS).
+    Ưu tiên thẻ nằm trong search-web-accommodation-card, theo thứ tự DOM.
+    """
+    filt = _norm_hotel_filter_text(filter_raw)
+    if not filt:
+        return None
+
+    async def _scan_cards_v2() -> float | None:
+        """(thứ tự DOM, giá, is_accom) — lấy thẻ khớp đầu tiên trong nhóm ưu tiên."""
+        hits: list[tuple[int, float, bool]] = []
+        dom_i = 0
+        for frame in page.frames:
+            try:
+                loc = frame.locator("[data-property-id]")
+                n = await loc.count()
+                for i in range(n):
+                    el = loc.nth(i)
+                    try:
+                        has_accom = await el.evaluate(
+                            """(el) => !!(el.closest(
+                                '[data-selenium="search-web-accommodation-card"]'
+                            ))"""
+                        )
+                        blob = await el.evaluate(
+                            """(el) => {
+                            const r =
+                                el.closest('[data-selenium="search-web-accommodation-card"]') ||
+                                el.closest('[data-selenium="hotel-item"]') ||
+                                el.closest('li') ||
+                                el;
+                            return (r && r.innerText) ? r.innerText : (el.innerText || '');
+                        }"""
+                        )
+                    except Exception:
+                        dom_i += 1
+                        continue
+                    cn = _norm_hotel_filter_text(blob or "")
+                    if not _card_text_matches_hotel_filter(cn, filt):
+                        dom_i += 1
+                        continue
+                    v = _parse_agoda_card_ui_final_vnd(blob or "")
+                    if v is None:
+                        dom_i += 1
+                        continue
+                    hits.append((dom_i, float(v), bool(has_accom)))
+                    dom_i += 1
+            except Exception:
+                continue
+        if not hits:
+            return None
+        ac = [h for h in hits if h[2]]
+        pool = ac if ac else hits
+        pool.sort(key=lambda t: t[0])
+        return pool[0][1]
+
+    v = await _scan_cards_v2()
+    if v is not None:
+        return v
+    await asyncio.sleep(3.5)
+    for _ in range(5):
+        try:
+            await page.evaluate("() => window.scrollBy(0, 500)")
+        except Exception:
+            break
+        await asyncio.sleep(0.45)
+    return await _scan_cards_v2()
+
+
+async def _agoda_ui_price_from_main_inner_text(page, filter_raw: str) -> float | None:
+    """
+    Fallback khi không có / không đọc được [data-property-id]: cắt đoạn quanh tên KS trong main/body.
+    """
+    filt = _norm_hotel_filter_text(filter_raw)
+    if not filt:
+        return None
+    tokens = [t for t in filt.split() if len(t) > 2]
+    for frame in page.frames:
+        try:
+            blob = await frame.evaluate(
+                """() => {
+                const m = document.querySelector('main');
+                return (m && m.innerText) ? m.innerText : (document.body.innerText || '');
+            }"""
+            )
+        except Exception:
+            continue
+        if not blob or len(blob) < 80:
+            continue
+        low = blob.lower()
+        pos = -1
+        for t in [filt] + tokens:
+            j = low.find(t.lower())
+            if j >= 0:
+                pos = j
+                break
+        if pos < 0:
+            head_n = _norm_hotel_filter_text(blob[:50000])
+            if not _card_text_matches_hotel_filter(head_n, filt):
+                continue
+            pos = 0
+        chunk = blob[pos : pos + 4500]
+        v = _parse_agoda_card_ui_final_vnd(chunk)
+        if v is not None:
+            return v
+    return None
+
+
+async def _agoda_ui_price_for_hotel_name_query(page, filter_raw: str) -> float | None:
+    """Thẻ property → scroll retry → main/body text."""
+    v = await _agoda_ui_price_for_name_filter(page, filter_raw)
+    if v is not None:
+        return v
+    return await _agoda_ui_price_from_main_inner_text(page, filter_raw)
+
+
+def _agoda_merge_cheaper_inclusive_row(old: dict, new: dict) -> dict:
+    """Giữ bản ghi có Giá/đêm (đã gồm thuế) thấp hơn (cùng propertyId)."""
+    ao = _parse_agoda_price_amount_vnd(old.get("Giá/đêm (đã gồm thuế)", "") or "")
+    an = _parse_agoda_price_amount_vnd(new.get("Giá/đêm (đã gồm thuế)", "") or "")
+    if an is not None and (ao is None or an < ao):
+        return new
+    return old
+
+
+def _agoda_ui_lookup_keys_for_hotel(
+    pid_str: str,
+    property_page: str,
+    extra_link_strings: tuple[str, ...] = (),
+) -> list[str]:
+    """Khớp map DOM: GraphQL có thể dùng propertyId khác hid trên link thẻ."""
+    keys: list[str] = []
+    for s in (pid_str or "",):
+        s = str(s).strip()
+        if s:
+            keys.append(s)
+    url_parts = [property_page or ""] + list(extra_link_strings or ())
+    q_re = re.compile(
+        r"[?&](?:hid|hotel|hotelId|hotel_id|propertyId|property_id)=(\d{4,14})\b",
+        re.I,
+    )
+    for pp in url_parts:
+        pp = (pp or "").strip()
+        if not pp:
+            continue
+        for m in q_re.finditer(pp):
+            keys.append(m.group(1))
+        for rx in _AGODA_ID_URL_RES:
+            m = rx.search(pp)
+            if m:
+                keys.append(m.group(1))
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _parse_agoda_card_ui_final_vnd(card_text: str) -> float | None:
+    """
+    Giá đỏ ngay trên dòng 'Mỗi đêm…' / 'Per night…'.
+    Không dùng min() trong cửa sổ rộng — sẽ chọn nhầm mức trung gian (vd. ~401k thay vì ~364k sau coupon).
+    Lấy số tiền **sát anchor nhất** (rightmost trong ~300 ký tự phía trước anchor **đầu tiên** trong phần đầu thẻ).
+    """
+    if not card_text:
+        return None
+    text = card_text.replace("\xa0", " ")
+    head = text[:6500]
+    primary_anchor = re.compile(
+        r"Mỗi đêm|mỗi đêm|Per night|per night",
+        re.I,
+    )
+    fallback_anchor = re.compile(
+        r"đã gồm thuế|taxes and fees|Thuế và phí",
+        re.I,
+    )
+    # Không dùng \s sau số: sẽ nuốt \n và làm mất dòng giá kế tiếp (promo dưới rack).
+    money_pat = re.compile(
+        r"(?:^|[^\d])((?:\d{1,3}(?:\.\d{3})+|\d{1,3}(?:,\d{3})+))[ \t\u00a0]*(?:đ|₫|VND)?",
+        re.I,
+    )
+
+    def _tok_to_float(tok: str) -> float | None:
+        t = tok.strip()
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", t):
+            return float(t.replace(".", ""))
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+", t):
+            return float(t.replace(",", ""))
+        return None
+
+    def _rightmost_money_before(idx: int, win_w: int = 320) -> float | None:
+        start = max(0, idx - win_w)
+        win = head[start:idx]
+        last_v: float | None = None
+        last_end = -1
+        for mm in money_pat.finditer(win):
+            v = _tok_to_float(mm.group(1))
+            if v is None or not (120_000 <= v <= 99_000_000):
+                continue
+            if mm.end() > last_end:
+                last_end = mm.end()
+                last_v = v
+        return last_v
+
+    m = primary_anchor.search(head)
+    if not m:
+        m = fallback_anchor.search(head)
+    if m:
+        v = _rightmost_money_before(m.start())
+        if v is not None:
+            return v
+
+    vals: list[float] = []
+    for mm in money_pat.finditer(head):
+        v = _tok_to_float(mm.group(1))
+        if v is not None and 280_000 <= v <= 80_000_000:
+            vals.append(v)
+    return min(vals) if vals else None
+
+
+async def _agoda_ui_map_via_playwright_locators(page) -> dict[str, float]:
+    """Dự phòng khi page.evaluate không thấy thẻ (iframe / cây DOM khác)."""
+    out: dict[str, float] = {}
+    for frame in page.frames:
+        try:
+            loc = frame.locator("[data-property-id]")
+            n = await loc.count()
+            for i in range(n):
+                el = loc.nth(i)
+                try:
+                    pid = await el.get_attribute("data-property-id")
+                except Exception:
+                    continue
+                if not pid or not str(pid).strip().isdigit():
+                    continue
+                pid = str(pid).strip()
+                try:
+                    card_text = await el.evaluate(
+                        """(el) => {
+                        const r =
+                            el.closest('[data-selenium="search-web-accommodation-card"]') ||
+                            el.closest('[data-selenium="hotel-item"]') ||
+                            el.closest('article') ||
+                            el.closest('li') ||
+                            el;
+                        return (r && r.innerText) ? r.innerText : (el.innerText || '');
+                    }"""
+                    )
+                except Exception:
+                    continue
+                v = _parse_agoda_card_ui_final_vnd(card_text or "")
+                if v is None:
+                    continue
+                if pid not in out or v < out[pid]:
+                    out[pid] = v
+        except Exception:
+            continue
+    return out
+
+
+async def _agoda_ui_shown_price_vnd_by_property_id(page) -> dict[str, float]:
+    """
+    Giá đỏ trên thẻ sau GIẢM % + coupon (vd. 364.609 đ / 647.800 ₫ kèm dòng Mỗi đêm…).
+    Gắn giá với mọi id tìm được trên thẻ (data-property-id, hid=, hotel=…) vì API/DOM lệch id.
+    Chạy trên mọi frame + locator Playwright (kết quả search đôi nằm trong iframe).
+    """
+    merged: dict[str, float] = {}
+    _card_price_js = """() => {
+                const out = {};
+                function allDeepQuerySelectorAll(root, selector, acc) {
+                    try {
+                        root.querySelectorAll(selector).forEach((el) => acc.push(el));
+                    } catch (e) {}
+                    root.querySelectorAll('*').forEach((el) => {
+                        if (el.shadowRoot) allDeepQuerySelectorAll(el.shadowRoot, selector, acc);
+                    });
+                }
+                function parseMoneyToken(tok) {
+                    const s = String(tok || '').trim();
+                    if (/^\\d{1,3}(\\.\\d{3})+$/.test(s)) {
+                        return parseInt(s.replace(/\\./g, ''), 10);
+                    }
+                    if (/^\\d{1,3}(,\\d{3})+$/.test(s)) {
+                        return parseInt(s.replace(/,/g, ''), 10);
+                    }
+                    return NaN;
+                }
+                function parseFromCardText(t) {
+                    const text = (t || '').replace(/\\u00a0/g, ' ');
+                    const head = text.slice(0, 6500);
+                    const primary = /Mỗi đêm|mỗi đêm|Per night|per night/i;
+                    const fallback = /đã gồm thuế|taxes and fees|Thuế và phí/i;
+                    const moneyRe =
+                        /([\\d]{1,3}(?:\\.\\d{3})+|[\\d]{1,3}(?:,\\d{3})+)[ \\t\\u00a0]*(?:đ|₫|\\bVND\\b)?/gi;
+                    let nightIdx = head.search(primary);
+                    if (nightIdx < 0) {
+                        nightIdx = head.search(fallback);
+                    }
+                    if (nightIdx >= 0) {
+                        const win = head.slice(Math.max(0, nightIdx - 320), nightIdx);
+                        let bestV = null;
+                        let bestEnd = -1;
+                        let m;
+                        while ((m = moneyRe.exec(win)) !== null) {
+                            const v = parseMoneyToken(m[1]);
+                            if (v >= 120000 && v <= 99000000 && m.index + m[0].length > bestEnd) {
+                                bestEnd = m.index + m[0].length;
+                                bestV = v;
+                            }
+                        }
+                        if (bestV != null) return bestV;
+                    }
+                    const vals = [];
+                    let m2;
+                    moneyRe.lastIndex = 0;
+                    while ((m2 = moneyRe.exec(head)) !== null) {
+                        const v = parseMoneyToken(m2[1]);
+                        if (v >= 280000 && v <= 80000000) vals.push(v);
+                    }
+                    if (!vals.length) return null;
+                    return Math.min.apply(null, vals);
+                }
+                function collectIdsForCard(root) {
+                    const ids = new Set();
+                    const add = (v) => {
+                        if (v && /^[0-9]{4,14}$/.test(String(v).trim())) {
+                            ids.add(String(v).trim());
+                        }
+                    };
+                    try {
+                        add(root.getAttribute('data-property-id'));
+                        root.querySelectorAll('[data-property-id]').forEach((n) => {
+                            add(n.getAttribute('data-property-id'));
+                        });
+                        root.querySelectorAll('[data-hotelid],[data-hotel-id]').forEach((n) => {
+                            add(n.getAttribute('data-hotelid') || n.getAttribute('data-hotel-id'));
+                        });
+                    } catch (e) {}
+                    root.querySelectorAll('a[href]').forEach((a) => {
+                        let h = a.getAttribute('href') || '';
+                        if (!h) return;
+                        const tryH = (s) => {
+                            let m = s.match(/[?&]hid=(\\d{4,14})/i);
+                            if (m) add(m[1]);
+                            m = s.match(/[?&]hotel[_]?id=(\\d{4,14})/i);
+                            if (m) add(m[1]);
+                            m = s.match(/[?&]hotel=(\\d{4,14})\\b/i);
+                            if (m) add(m[1]);
+                            m = s.match(/[?&]propertyId=(\\d{4,14})\\b/i);
+                            if (m) add(m[1]);
+                            m = s.match(/\\/(\\d{4,14})\\.html/i);
+                            if (m) add(m[1]);
+                        };
+                        tryH(h);
+                        if (!h.startsWith('http')) {
+                            tryH('https://www.agoda.com' + (h.startsWith('/') ? h : '/' + h));
+                        }
+                    });
+                    return [...ids];
+                }
+                function assignPriceToIds(ids, card) {
+                    if (!card || !ids.length) return;
+                    const v = parseFromCardText(card.innerText || '');
+                    if (v == null) return;
+                    ids.forEach((pid) => {
+                        if (!out[pid] || v < out[pid]) out[pid] = v;
+                    });
+                }
+                const roots = [];
+                const seenRoot = new Set();
+                function addRoot(el) {
+                    if (el && !seenRoot.has(el)) {
+                        seenRoot.add(el);
+                        roots.push(el);
+                    }
+                }
+                let acc = [];
+                allDeepQuerySelectorAll(
+                    document,
+                    '[data-selenium="search-web-accommodation-card"]',
+                    acc
+                );
+                acc.forEach(addRoot);
+                if (!roots.length) {
+                    acc = [];
+                    allDeepQuerySelectorAll(document, '[data-selenium="hotel-item"]', acc);
+                    acc.forEach(addRoot);
+                }
+                if (!roots.length) {
+                    acc = [];
+                    allDeepQuerySelectorAll(
+                        document,
+                        '[data-element-name="property-card-container"]',
+                        acc
+                    );
+                    acc.forEach(addRoot);
+                }
+                if (!roots.length) {
+                    document.querySelectorAll('[data-property-id]').forEach((el) => {
+                        let r = el.closest('[data-selenium="search-web-accommodation-card"]');
+                        if (!r) r = el.closest('[data-selenium="hotel-item"]');
+                        if (!r) r = el.closest('li');
+                        if (!r) r = el;
+                        addRoot(r);
+                    });
+                }
+                roots.forEach((root) => {
+                    const ids = collectIdsForCard(root);
+                    if (ids.length) assignPriceToIds(ids, root);
+                });
+                return out;
+            }"""
+    try:
+        for frame in page.frames:
+            try:
+                raw = await frame.evaluate(_card_price_js)
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        ks = str(k).strip()
+                        try:
+                            vf = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        if ks and (ks not in merged or vf < merged[ks]):
+                            merged[ks] = vf
+            except Exception:
+                continue
+        loc_map = await _agoda_ui_map_via_playwright_locators(page)
+        for k, v in loc_map.items():
+            if k not in merged or v < merged[k]:
+                merged[k] = v
+    except Exception:
+        pass
+    return merged
+
+
 def _extract_price(hotel: dict) -> str:
-    """Extract cheapest exclusive (before-tax) price per night."""
+    """Exclusive / đêm — cùng một offer với giá inclusive đã chọn (_collect_prices)."""
     entries = _collect_prices(hotel)
     if entries:
         e = entries[0]
@@ -267,7 +1031,7 @@ def _extract_price(hotel: dict) -> str:
 
 
 def _extract_price_inclusive(hotel: dict) -> str:
-    """Extract cheapest inclusive (with-tax) price per night."""
+    """Inclusive / đêm — offer có giá đã gồm thuế thấp nhất (ưu tiên VND)."""
     entries = _collect_prices(hotel)
     if entries:
         e = entries[0]
@@ -599,7 +1363,13 @@ def _extract_agoda_property_geo(hotel: dict) -> tuple[str, str, str]:
     return pid_str, lat_s, lng_s
 
 
-def parse_hotel_from_graphql(hotel: dict, destination: str) -> dict | None:
+def parse_hotel_from_graphql(
+    hotel: dict,
+    destination: str,
+    ui_shown_price_vnd_by_property_id: dict[str, float] | None = None,
+    ui_name_filter_price_vnd: float | None = None,
+    ui_name_filter_query: str = "",
+) -> dict | None:
     """Extract all fields from a GraphQL hotel property object."""
     info = _safe_get(hotel, "content", "informationSummary", default={})
     name = info.get("displayName") or info.get("defaultName")
@@ -615,16 +1385,56 @@ def parse_hotel_from_graphql(hotel: dict, destination: str) -> dict | None:
     stars_raw = info.get("rating")
     stars = f"{int(stars_raw)} sao" if stars_raw else ""
 
-    price_excl = _extract_price(hotel)
-    price_incl = _extract_price_inclusive(hotel)
+    property_page = _safe_get(info, "propertyLinks", "propertyPage", default="") or ""
+    link_extra: list[str] = []
+    plinks = info.get("propertyLinks")
+    if isinstance(plinks, dict):
+        for sub in ("propertyUrl", "mobileDeepLink", "desktopUrl", "seoUrl", "deepLink"):
+            u = plinks.get(sub)
+            if isinstance(u, str) and u.strip():
+                link_extra.append(u.strip())
+
+    pid_str, lat_s, lng_s = _extract_agoda_property_geo(hotel)
+
+    incl_gql_s = _extract_price_inclusive(hotel)
+    excl_gql_s = _extract_price(hotel)
+    price_incl = incl_gql_s
+    price_excl = excl_gql_s
+
+    def _apply_dom_or_ui_price(ui_f: float) -> None:
+        nonlocal price_incl, price_excl
+        price_incl = _format_price(ui_f, "VND")
+        ain = _parse_agoda_price_amount_vnd(incl_gql_s)
+        aex = _parse_agoda_price_amount_vnd(excl_gql_s)
+        if ain is not None and aex is not None and ain > 0:
+            price_excl = _format_price(ui_f * (float(aex) / float(ain)), "VND")
+
+    ui_applied = False
+    if (
+        ui_name_filter_price_vnd is not None
+        and (ui_name_filter_query or "").strip()
+        and _hotel_name_matches_search_filter(name, ui_name_filter_query)
+    ):
+        ufn = float(ui_name_filter_price_vnd)
+        if ufn >= 150_000:
+            _apply_dom_or_ui_price(ufn)
+            ui_applied = True
+    if not ui_applied and ui_shown_price_vnd_by_property_id:
+        ui_amt = None
+        for k in _agoda_ui_lookup_keys_for_hotel(
+            pid_str, property_page, tuple(link_extra)
+        ):
+            v = ui_shown_price_vnd_by_property_id.get(k)
+            if v is not None:
+                ui_amt = v
+                break
+        if ui_amt is not None and float(ui_amt) >= 200_000:
+            _apply_dom_or_ui_price(float(ui_amt))
     meal_plan = _extract_meal_plan(hotel)
     cancellation = _extract_cancellation(hotel)
     review = _extract_review_score(hotel)
 
-    property_page = _safe_get(info, "propertyLinks", "propertyPage", default="")
     url = f"https://www.agoda.com{property_page}" if property_page else ""
-
-    pid_str, lat_s, lng_s = _extract_agoda_property_geo(hotel)
 
     return {
         "Tỉnh thành / Điểm đến": destination,
@@ -651,13 +1461,24 @@ def parse_hotel_from_graphql(hotel: dict, destination: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def get_total_pages(page) -> int:
+    """
+    Số trang từ thanh phân trang Agoda (đa ngôn ngữ).
+    """
     try:
         el = page.locator("[data-selenium='pagination-text']")
         if await el.count() > 0:
             text = (await el.text_content() or "").strip()
-            m = re.search(r"trên\s+(\d+)", text)
-            if m:
-                return int(m.group(1))
+            for pat in (
+                r"trên\s+(\d+)",
+                r"of\s+(\d+)",
+                r"/\s*(\d+)\s*$",
+                r"(\d+)\s*$",
+            ):
+                m = re.search(pat, text, re.I)
+                if m:
+                    n = int(m.group(1))
+                    if 1 <= n <= 500:
+                        return n
     except Exception:
         pass
     return 1
@@ -707,12 +1528,20 @@ async def pagination_next_available(
     Còn trang sau không. Chờ nút Next xuất hiện (tránh dừng nhầm ở trang 1).
     Nếu API/DOM báo còn trang mà nút chưa thấy, vẫn trả True để thử click.
     Trang ~45–50 KS mà metadata báo 1 trang: vẫn thử Next (Agoda hay báo sai).
+
+    Lưu ý: Agoda thường ~40 KS/trang; ngưỡng cũ props_on_page>=42 khiến dừng sớm (~200 KS / 5 trang).
     """
     await scroll_pagination_into_view(page)
     await asyncio.sleep(0.45)
 
+    try:
+        dom_pages_fresh = await get_total_pages(page)
+        total_pages_hint = max(total_pages_hint, dom_pages_fresh)
+    except Exception:
+        pass
+
     state: bool | None = None
-    for _ in range(18):
+    for _ in range(22):
         state = await _next_button_clickable(page)
         if state is not None:
             break
@@ -721,10 +1550,14 @@ async def pagination_next_available(
     if state is True:
         return True
     if state is False:
+        if current_page < total_pages_hint:
+            return True
+        if props_on_page >= 28:
+            return True
         return False
     if current_page < total_pages_hint:
         return True
-    if props_on_page >= 42:
+    if props_on_page >= 28:
         return True
     return False
 
@@ -823,23 +1656,42 @@ def _max_total_pages_from_nodes(nodes: list, dom_pages: int) -> int:
 # ---------------------------------------------------------------------------
 
 async def _agoda_route_skip_heavy_assets(route) -> None:
-    """Chặn ảnh / font / media để tải trang nhẹ hơn; giữ script & stylesheet cho UI phân trang."""
-    if route.request.resource_type in ("image", "media", "font"):
+    """
+    Chặn font / media (nhẹ băng thông). Giữ ảnh: Agoda thường không hydrate thẻ kết quả / giá
+    khi ảnh bị chặn — DOM giá UI = 0 selector, scraper chỉ còn giá API lệch promo.
+    """
+    if route.request.resource_type in ("media", "font"):
         await route.abort()
     else:
         await route.continue_()
 
 
-async def scrape_agoda(url: str, destination: str, status_callback=None) -> list:
+async def scrape_agoda(
+    url: str,
+    destination: str,
+    status_callback=None,
+    visible_browser: bool | None = None,
+) -> list:
     """
-    Fast scraper: navigates pages with the browser but extracts hotel data
-    directly from intercepted GraphQL responses (no DOM scraping, no scrolling).
+    Kết hợp GraphQL (intercept) + giá hiển thị trên thẻ khi cần (URL có hotelName= hoặc map id).
+    visible_browser=True: mở cửa sổ Chrome (thường cần để giá khớp UI Agoda).
     """
     results = []
 
     async with async_playwright() as pw:
+        if visible_browser is True:
+            headless_on = False
+        elif visible_browser is False:
+            headless_on = True
+        else:
+            headless_on = os.environ.get("AGODA_HEADLESS", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
         launch_kwargs = dict(
-            headless=True,
+            headless=headless_on,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -897,7 +1749,7 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
                 try:
                     await page.goto(
                         url,
-                        wait_until="domcontentloaded",
+                        wait_until="load",
                         timeout=90000,
                     )
                     break
@@ -912,7 +1764,13 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
                 await page.wait_for_load_state("load", timeout=25000)
             except Exception:
                 pass
-            await asyncio.sleep(2.0)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=22000)
+            except Exception:
+                pass
+            await asyncio.sleep(6.0)
+
+            hotel_name_q = _agoda_search_hotel_name_filter(url)
 
             try:
                 first_node = await _poll_first_city_search(
@@ -933,7 +1791,7 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
                 )
 
             current_page = 1
-            seen_property_ids: set[str] = set()
+            pid_to_result_index: dict[str, int] = {}
 
             while True:
                 try:
@@ -956,14 +1814,81 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
                         f"{len(properties)} khách sạn — Đã gom: {len(results)} (unique id)"
                     )
 
+                ui_shown_vnd: dict[str, float] = {}
+                try:
+                    try:
+                        await page.wait_for_selector(
+                            '[data-property-id],[data-selenium="search-web-accommodation-card"]',
+                            timeout=28000,
+                        )
+                    except Exception:
+                        pass
+                    for _ in range(4):
+                        await page.evaluate(
+                            "() => window.scrollTo(0, document.body.scrollHeight)"
+                        )
+                        await asyncio.sleep(0.55)
+                    await page.evaluate("() => window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.45)
+                    ui_shown_vnd = await _agoda_ui_shown_price_vnd_by_property_id(page)
+                except Exception:
+                    ui_shown_vnd = {}
+
+                ui_name_price: float | None = None
+                if hotel_name_q:
+                    try:
+                        ui_name_price = await _agoda_ui_price_for_hotel_name_query(
+                            page, hotel_name_q
+                        )
+                    except Exception:
+                        ui_name_price = None
+                    if ui_name_price is None and hotel_name_q:
+                        if status_callback:
+                            status_callback(
+                                "Chưa đọc được giá trên giao diện — chờ thêm 20s và thử lại…"
+                            )
+                        await asyncio.sleep(20.0)
+                        for _ in range(6):
+                            try:
+                                await page.evaluate(
+                                    "() => window.scrollTo(0, document.body.scrollHeight)"
+                                )
+                            except Exception:
+                                break
+                            await asyncio.sleep(0.5)
+                        try:
+                            await page.evaluate("() => window.scrollTo(0, 0)")
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.0)
+                        try:
+                            ui_name_price = await _agoda_ui_price_for_hotel_name_query(
+                                page, hotel_name_q
+                            )
+                        except Exception:
+                            pass
+
                 for hotel in properties:
                     pid_key = _agoda_property_id_from_hotel(hotel)
+                    record = parse_hotel_from_graphql(
+                        hotel,
+                        destination,
+                        ui_shown_price_vnd_by_property_id=ui_shown_vnd or None,
+                        ui_name_filter_price_vnd=ui_name_price,
+                        ui_name_filter_query=hotel_name_q,
+                    )
+                    if not record:
+                        continue
                     if pid_key:
-                        if pid_key in seen_property_ids:
-                            continue
-                        seen_property_ids.add(pid_key)
-                    record = parse_hotel_from_graphql(hotel, destination)
-                    if record:
+                        if pid_key in pid_to_result_index:
+                            idx = pid_to_result_index[pid_key]
+                            results[idx] = _agoda_merge_cheaper_inclusive_row(
+                                results[idx], record
+                            )
+                        else:
+                            pid_to_result_index[pid_key] = len(results)
+                            results.append(record)
+                    else:
                         results.append(record)
 
                 if current_page >= 150:
@@ -1032,8 +1957,16 @@ async def scrape_agoda(url: str, destination: str, status_callback=None) -> list
     return results
 
 
-def run_scrape(url: str, destination: str, status_callback=None) -> list:
+def run_scrape(
+    url: str,
+    destination: str,
+    status_callback=None,
+    *,
+    visible_browser: bool | None = None,
+) -> list:
     """Synchronous wrapper."""
     _ensure_windows_proactor_policy()
     ensure_playwright_chromium(status_callback)
-    return asyncio.run(scrape_agoda(url, destination, status_callback))
+    return asyncio.run(
+        scrape_agoda(url, destination, status_callback, visible_browser=visible_browser)
+    )

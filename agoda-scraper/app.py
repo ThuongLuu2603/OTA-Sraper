@@ -682,6 +682,7 @@ for key, default in [
     ("active_case_key", ""), ("compare_df", None),
     ("global_compare_df", None),
     ("trigger_scrape", False), ("trip_city_info", None),
+    ("agoda_visible_browser", False),
     ("mytour_city_info", None),     ("check_in_str", ""), ("check_out_str", ""),
     ("hotel_compare_on", False),
 ]:
@@ -978,6 +979,11 @@ elif segment_name == "Tour":
 
 # ── AGODA ────────────────────────────────────────────────────────────────────
 elif ota_name == "Agoda":
+    st.checkbox(
+        "Hiện cửa sổ trình duyệt khi scrape (khuyến nghị nếu giá không khớp giá đỏ trên Agoda)",
+        key="agoda_visible_browser",
+        help="Chrome không headless. Nhiều phiên bản Agoda chỉ hiển thị đúng giá sau coupon khi có cửa sổ thật.",
+    )
     tab1, tab2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
 
     with tab1:
@@ -1739,7 +1745,12 @@ if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
                     raise ValueError(f"Nguồn tour chưa hỗ trợ: {active_source}")
                 st.session_state.scrape_results = results
             elif active_source == "Agoda":
-                raw_results = run_scrape(url=active_url, destination=active_destination, status_callback=update_status)
+                raw_results = run_scrape(
+                    url=active_url,
+                    destination=active_destination,
+                    status_callback=update_status,
+                    visible_browser=st.session_state.get("agoda_visible_browser", False),
+                )
                 st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)
             elif active_source == "Trip.com":
                 raw_results = run_scrape_tripcom(url=active_url, destination=active_destination, status_callback=update_status)
