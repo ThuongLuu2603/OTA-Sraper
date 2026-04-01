@@ -143,6 +143,20 @@ def _clean_price(text: str) -> str:
     return t
 
 
+def _ivivu_hotel_path_key(url: str) -> str:
+    """Chuẩn hóa path khách sạn để ghép ribbon DOM ↔ API."""
+    if not url or not str(url).strip():
+        return ""
+    u = str(url).strip()
+    if not u.startswith("http"):
+        u = f"https://www.ivivu.com{u if u.startswith('/') else '/' + u}"
+    try:
+        p = urlparse(u)
+        return (p.path or "").rstrip("/").lower()
+    except Exception:
+        return ""
+
+
 def _full_url(path_or_url: str) -> str:
     if not path_or_url:
         return ""
@@ -235,7 +249,10 @@ def _ivivu_clean_taf_text(s: str, max_len: int = 500) -> str:
 
 
 # Không dùng "nghỉ dưỡng" đơn lẻ — trùng tên KS ("Khu Nghỉ Dưỡng …") gây nhầm thành ribbon.
+# [Ưư]/[đĐ] vì re.I không gập dấu tiếng Việt; thêm tag "đề xuất".
 _IVIVU_MARKETING_RIBBON = re.compile(
+    r"(?:[Ưư])u\s*(?:[đĐ])ãi|"
+    r"[đĐ]ề\s*xuất|"
     r"ưu\s*đãi|khuyến\s*mãi|đặc\s*biệt|trọn\s*gói|flash\s*sale|"
     r"dành\s*cho\s*khách|áp\s*dụng\s*cho|expats|miễn\s*phí\s*hủy|"
     r"combo\s*fantastic|nghỉ\s*dưỡng\s+trọn|ưu\s*đãi\s+.*nghỉ|"
@@ -251,13 +268,65 @@ def _ivivu_text_looks_like_marketing_ribbon(s: str) -> bool:
     return bool(_IVIVU_MARKETING_RIBBON.search(s))
 
 
+# Gói đêm bất kỳ: X đêm + Y (ngày/đêm), chữ N/n + D/Đ — 2N1Đ, 4N3D, 2N2D, 5N4D, 10N9Đ...
+_IVIVU_NIGHT_DAY_TOKEN = re.compile(
+    r"(?<![A-Za-zÀ-ỹ0-9])(\d+)\s*[Nn]\s*(\d+)(?:\s*[Đđ]|\s*D)(?![A-Za-zÀ-ỹ])",
+    re.I,
+)
+
+
 def _ivivu_text_looks_like_promo_badge(s: str) -> bool:
-    """Có mẫu gói đêm kiểu 2N1Đ — không phải tag địa điểm/tiện ích."""
+    """Có mẫu gói XN YĐ (mọi số), đêm/ngày, hoặc tag Ưu đãi / Đề xuất."""
     if not s or len(s) > 220:
         return False
-    if re.search(r"\d+\s*[Nn]\s*\d+\s*[Đđ]", s):
+    if _IVIVU_NIGHT_DAY_TOKEN.search(s):
         return True
-    return bool(re.search(r"(?<![A-Za-zÀ-ỹ])\d+\s*[Nn]\s*\d+\s*D(?:\s|[+|]|$)", s))
+    if re.search(r"\d+\s*đêm", s, re.I):
+        return True
+    if re.search(r"\d+\s*ngày\s*\d+\s*đêm", s, re.I):
+        return True
+    if re.search(r"(?:[Ưư])u\s*(?:[đĐ])ãi", s):
+        return True
+    if re.search(r"[đĐ]ề\s*xuất", s, re.I):
+        return True
+    return False
+
+
+def _ivivu_text_looks_like_generic_promo_snippet(s: str) -> bool:
+    """
+    Ribbon không theo mẫu XN YĐ: % giảm, giá rút gọn, voucher, CTA ngắn…
+    (chỉ chuỗi tương đối ngắn để tránh nuốt mô tả dài).
+    """
+    if not s or len(s) > 140:
+        return False
+    if _ivivu_text_looks_like_amenity_location_chip(s):
+        return False
+    t = s.lower()
+    checks = (
+        r"%",
+        r"\d+\s*%",
+        r"giảm\s*\d",
+        r"giảm\s+giá",
+        r"chỉ\s+từ",
+        r"chỉ\s+còn",
+        r"tặng\s+",
+        r"miễn\s+phí\s+hủy",
+        r"voucher",
+        r"coupon",
+        r"early\s*bird",
+        r"hot\s*deal",
+        r"flash\s*sale",
+        r"\d+\s*tr(?:\s|\.|,|\d)",
+        r"\d{1,3}(?:[.,]\d{3})+\s*(?:đ|vnđ|k\b)",
+        r"\d+k\b",
+        r"đặt\s+trước",
+        r"(?:[Ưư])u\s*(?:[đĐ])ãi",
+        r"[đĐ]ề\s*xuất",
+        r"ưu\s*đãi\s+giới\s+hạn",
+        r"combo\s+",
+        r"gói\s+",
+    )
+    return any(re.search(p, t, re.I) for p in checks)
 
 
 def _ivivu_text_same_as_hotel_name(s: str, hotel_name: str) -> bool:
@@ -296,7 +365,7 @@ def _ivivu_text_looks_like_amenity_location_chip(s: str) -> bool:
 
 
 def _ivivu_string_to_badge(s: str) -> str:
-    """Gộp nhận diện gói đêm + dòng marketing; lọc chip tiện ích."""
+    """Gộp nhận diện gói XN YĐ (mọi số), marketing ribbon, hoặc snippet promo khác; lọc chip tiện ích."""
     t = _ivivu_clean_taf_text(s, max_len=900)
     if not t or _ivivu_text_looks_like_amenity_location_chip(t):
         return ""
@@ -310,26 +379,21 @@ def _ivivu_string_to_badge(s: str) -> str:
         return combo
     if _ivivu_text_looks_like_marketing_ribbon(t) or _ivivu_text_looks_like_promo_badge(t):
         return t[:900]
+    if _ivivu_text_looks_like_generic_promo_snippet(t):
+        return t[:900]
     return ""
 
 
 def _ivivu_slice_combo_badge(s: str) -> str:
     """
-    Cắt đúng đoạn badge promo: từ 2N1Đ… tới tối đa 2 nhánh | (thường là giá 1tr099 / 750k).
-    Không lấy chuỗi chỉ có 'Bãi Sau | Xe đưa đón…' (không có NĐêm).
+    Cắt đoạn bắt đầu bằng XN YĐ (X,Y bất kỳ): …Đ / …D + tối đa một nhánh | (thường là giá).
+    Không lấy chuỗi chỉ chip địa điểm (đã lọc trước đó).
     """
     t = _ivivu_clean_taf_text(s)
     if not t:
         return ""
-    # Tối đa một dấu | phía sau (tên gói | giá); tránh nuốt chữ nối sau giá.
     m = re.search(
-        r"(\d+\s*[Nn]\s*\d+\s*[Đđ][^|]{0,130}(?:\|[^|]{0,28})?)",
-        t,
-    )
-    if m:
-        return m.group(1).strip()[:220]
-    m = re.search(
-        r"(\d+\s*[Nn]\s*\d+\s*D[^|]{0,130}(?:\|[^|]{0,28})?)",
+        r"(\d+\s*[Nn]\s*\d+(?:\s*[Đđ]|\s*D)(?:[^|]{0,130}(?:\|[^|]{0,28})?)?)",
         t,
         re.I,
     )
@@ -347,7 +411,7 @@ def _ivivu_deep_find_badget_json(obj, depth: int = 0, max_d: int = 6) -> str:
     if isinstance(obj, dict):
         for k, v in obj.items():
             kn = str(k).lower().replace("_", "")
-            if "badget" in kn:
+            if "badget" in kn or "ribbon" in kn or kn.endswith("promotag") or kn == "promoline":
                 if isinstance(v, str):
                     t = _ivivu_clean_taf_text(v, max_len=900)
                     if t and not _ivivu_text_looks_like_amenity_location_chip(t):
@@ -473,11 +537,14 @@ def _ivivu_extract_badge_label(item: dict) -> str:
         "packagename",
         "flashsalelabel",
         "ribbontext",
+        "ribbontitle",
         "shortpromo",
         "promotiontitle",
         "offername",
         "salelabel",
         "productlabel",
+        "subheading",
+        "highlighttext",
     )
     for dk in direct_keys:
         got = _ivivu_badge_from_value(cmap.get(dk))
@@ -517,6 +584,62 @@ def _ivivu_extract_badge_label(item: dict) -> str:
                 return got
 
     return ""
+
+
+def _ivivu_merge_dom_badge_entries(first_items: list, dom_raw: list) -> list:
+    """
+    Gắn ribbon lấy từ DOM vào item API.
+    iVIVU đổi layout/class dễ làm thứ tự card ≠ thứ tự list — ưu tiên khớp theo path URL khách sạn.
+    """
+    entries: list[dict[str, str]] = []
+    for e in dom_raw or []:
+        if isinstance(e, dict):
+            p = str(e.get("path") or "").strip().lower().rstrip("/")
+            t = str(e.get("text") or "").strip()
+            if t:
+                entries.append({"path": p, "text": t})
+        elif isinstance(e, str) and e.strip():
+            entries.append({"path": "", "text": e.strip()})
+
+    path_map: dict[str, str] = {}
+    for ent in entries:
+        pk = ent["path"]
+        if pk:
+            path_map[pk] = ent["text"]
+    ordered_texts = [ent["text"] for ent in entries]
+
+    merged: list = []
+    for i, it in enumerate(first_items):
+        if not isinstance(it, dict):
+            merged.append(it)
+            continue
+        d = dict(it)
+        link = _full_url(d.get("hotelLink") or d.get("url") or "")
+        ap = _ivivu_hotel_path_key(link)
+        raw = ""
+        if ap and path_map:
+            if ap in path_map:
+                raw = path_map[ap]
+            else:
+                a_last = ap.split("/")[-1]
+                for dp, dt in path_map.items():
+                    if not dp:
+                        continue
+                    d_last = dp.split("/")[-1]
+                    if a_last and d_last and (
+                        a_last == d_last or ap.endswith(dp) or dp.endswith(ap)
+                    ):
+                        raw = dt
+                        break
+        if not raw and i < len(ordered_texts):
+            raw = ordered_texts[i]
+        if raw:
+            hn = (d.get("hotelName") or "").strip()
+            cleaned = _ivivu_clean_taf_text(raw, max_len=900)
+            if not _ivivu_text_same_as_hotel_name(cleaned, hn):
+                d["_ivivuPdvBadgetDom"] = cleaned
+        merged.append(d)
+    return merged
 
 
 def _parse_hotel(item: dict, destination: str) -> dict:
@@ -580,24 +703,41 @@ async def _capture_search_context(url: str, status_callback):
                 break
             await asyncio.sleep(0.5)
 
-        # Ribbon / nhãn promo trên từng card (2N1Đ, Ưu Đãi…), gom nhiều span / card bằng " • ".
+        # Ribbon / nhãn promo: selector mở rộng + fallback text + trả về {path,text} để khớp API khi thứ tự card lệch.
         if "body" in captured:
-            dom_texts: list[str] = []
+            dom_entries: list = []
             for _ in range(4):
                 try:
-                    dom_texts = await page.evaluate(
+                    dom_entries = await page.evaluate(
                         """() => {
                             const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                            /* Trong cùng card có nhiều ribbon (Ưu Đãi Đặc Biệt, Đặt Trước 5 Ngày…) — class có thể khác badget-text */
+                            function pathKey(href) {
+                                if (!href) return '';
+                                try {
+                                    const u = new URL(href, location.origin);
+                                    return u.pathname.replace(/\\/+$/, '').toLowerCase();
+                                } catch (e) { return ''; }
+                            }
+                            function primaryPathFromRoot(root) {
+                                const a = root.querySelector('a[href*="/khach-san/"]');
+                                return a ? pathKey(a.getAttribute('href')) : '';
+                            }
                             const strictSels = [
                                 '.pdv__badget-text',
                                 "[class*='pdv__badget-text']",
+                                "[class*='pdv__Badget']",
                                 "[class*='badget-text']",
+                                "[class*='badget']",
+                                "[class*='Badget']",
                                 "[class*='badge-text']",
+                                "[class*='badge__text']",
+                                "[data-testid*='badge']",
+                                "[data-testid*='ribbon']",
+                                "[data-testid*='promo']",
                             ];
-                            /* Chỉ dùng trong <a> có ảnh KS — tránh link tiêu đề (nuốt tên KS) */
                             const overlaySels = [
                                 "[class*='ribbon']",
+                                "[class*='Ribbon']",
                                 "[class*='pdv__ribbon']",
                                 "[class*='pdv__sale']",
                                 "[class*='pdv__promo']",
@@ -608,10 +748,12 @@ async def _capture_search_context(url: str, status_callback):
                                 "[class*='discount-tag']",
                                 "[class*='label--promo']",
                                 "[class*='uu-dai']",
+                                "[class*='sticker']",
+                                "[class*='chip'][class*='promo']",
                             ];
                             function findCardRoot(node) {
                                 let el = node;
-                                for (let i = 0; i < 14 && el; i++) {
+                                for (let i = 0; i < 16 && el; i++) {
                                     if (!el || el === document.body) return null;
                                     const cls = typeof el.className === 'string' ? el.className : '';
                                     const tag = (el.tagName || '').toUpperCase();
@@ -652,6 +794,21 @@ async def _capture_search_context(url: str, status_callback):
                                 }
                                 return parts.join(' • ');
                             }
+                            function ribbonFallback(root) {
+                                const rx = /(\\d+\\s*[Nn]\\s*\\d+(?:\\s*[ĐđDd])?|\\d+\\s*ngày\\s*\\d+\\s*đêm|Nghỉ\\s*\\d+|[Ưư]u\\s*[đĐ]ãi|[đĐ]ề\\s*xuất|ưu\\s*đãi|khuyến\\s*mãi|trọn\\s*gói|flash\\s*sale|\\d+\\s*đêm|giảm\\s*\\d|%|\\d+%|chỉ\\s+từ|\\d+k\\b)/i;
+                                const leaves = root.querySelectorAll('span, a, div, p, strong, em, label, h3, h4');
+                                const out = [];
+                                const seen = new Set();
+                                leaves.forEach((el) => {
+                                    if (el.children && el.children.length) return;
+                                    const t = norm(el.textContent);
+                                    if (t.length < 4 || t.length > 260 || !rx.test(t)) return;
+                                    if (seen.has(t)) return;
+                                    seen.add(t);
+                                    out.push(t);
+                                });
+                                return out.slice(0, 5).join(' • ');
+                            }
                             function collectFromRoot(root) {
                                 const linkScopes = imageLinkScopesInCard(root);
                                 const nodes = [];
@@ -668,8 +825,11 @@ async def _capture_search_context(url: str, status_callback):
                                 } else {
                                     const scope = root;
                                     strictSels.forEach((s) => addAll(scope, s));
+                                    overlaySels.forEach((s) => addAll(scope, s));
                                 }
-                                return finalizeRibbonNodes(nodes);
+                                let joined = finalizeRibbonNodes(nodes);
+                                if (!joined) joined = ribbonFallback(root);
+                                return joined;
                             }
                             const rootsOrdered = [];
                             const seenRoot = new WeakSet();
@@ -684,37 +844,53 @@ async def _capture_search_context(url: str, status_callback):
                                 const root = findCardRoot(a) || a.closest('li') || a.closest('[class*="item"]');
                                 if (root) pushRoot(root);
                             });
-                            if (rootsOrdered.length >= 3) {
+                            function pack(list) {
+                                return list.map((root) => ({
+                                    path: primaryPathFromRoot(root),
+                                    text: collectFromRoot(root),
+                                })).filter((x) => x.text);
+                            }
+                            if (rootsOrdered.length >= 2) {
                                 rootsOrdered.sort((a, b) => {
                                     const ra = a.getBoundingClientRect();
                                     const rb = b.getBoundingClientRect();
                                     return ra.top - rb.top || ra.left - rb.left;
                                 });
-                                return rootsOrdered.map((root) => collectFromRoot(root));
+                                return pack(rootsOrdered);
                             }
                             const flat = [];
                             document.querySelectorAll('a[href*="/khach-san/"]').forEach((a) => {
                                 if (!a.querySelector('img')) return;
-                                const nodes = [];
-                                const addAll = (selStr) => {
-                                    try {
-                                        a.querySelectorAll(selStr).forEach((el) => nodes.push(el));
-                                    } catch (e) {}
-                                };
-                                strictSels.forEach((s) => addAll(s));
-                                overlaySels.forEach((s) => addAll(s));
-                                const joined = finalizeRibbonNodes(nodes);
-                                if (joined) flat.push(joined);
+                                const href = a.getAttribute('href') || '';
+                                const text = collectFromRoot(a.closest('li') || a.parentElement || a) ||
+                                    (() => {
+                                        const nodes = [];
+                                        const addAll = (selStr) => {
+                                            try {
+                                                a.querySelectorAll(selStr).forEach((el) => nodes.push(el));
+                                            } catch (e) {}
+                                        };
+                                        strictSels.forEach((s) => addAll(s));
+                                        overlaySels.forEach((s) => addAll(s));
+                                        return finalizeRibbonNodes(nodes);
+                                    })();
+                                const t2 = text || ribbonFallback(a.closest('li') || a);
+                                if (t2) flat.push({ path: pathKey(href), text: t2 });
                             });
                             return flat;
                         }"""
                     )
                 except Exception:
-                    dom_texts = []
-                if isinstance(dom_texts, list) and dom_texts:
+                    dom_entries = []
+                if isinstance(dom_entries, list) and dom_entries:
                     break
-                await asyncio.sleep(0.9)
-            captured["dom_badget_texts"] = dom_texts if isinstance(dom_texts, list) else []
+                await asyncio.sleep(0.75)
+            captured["dom_badget_entries"] = dom_entries if isinstance(dom_entries, list) else []
+            captured["dom_badget_texts"] = [
+                (e.get("text") if isinstance(e, dict) else str(e))
+                for e in (dom_entries or [])
+                if (isinstance(e, dict) and e.get("text")) or (isinstance(e, str) and e.strip())
+            ]
 
         await browser.close()
     return captured if "body" in captured else None
@@ -791,26 +967,16 @@ async def _scrape_async(
 
     if not isinstance(first_items, list):
         first_items = []
+    dom_entries = ctx.get("dom_badget_entries")
     dom_bg = ctx.get("dom_badget_texts") or []
-    if dom_bg and first_items:
-        merged: list = []
-        for i, it in enumerate(first_items):
-            if isinstance(it, dict):
-                d = dict(it)
-                if i < len(dom_bg):
-                    raw = str(dom_bg[i] or "").strip()
-                    if raw:
-                        cleaned = _ivivu_clean_taf_text(raw, max_len=900)
-                        hn = (d.get("hotelName") or "").strip()
-                        if not _ivivu_text_same_as_hotel_name(cleaned, hn):
-                            d["_ivivuPdvBadgetDom"] = cleaned
-                merged.append(d)
-            else:
-                merged.append(it)
-        first_items = merged
+    if dom_entries is None and dom_bg:
+        dom_entries = [{"path": "", "text": t} for t in dom_bg if str(t).strip()]
+    if first_items and (dom_entries or dom_bg):
+        first_items = _ivivu_merge_dom_badge_entries(first_items, dom_entries or [])
+        nribbon = len(dom_entries) if dom_entries else len(dom_bg)
         status_callback(
-            f"ℹ️ iVIVU: nhãn ribbon (card DOM) — {len(dom_bg)} ô, "
-            f"ghép thứ tự với {len(first_items)} KS trang 1."
+            f"ℹ️ iVIVU: nhãn ribbon (DOM) — {nribbon} card, "
+            f"ghép theo URL + thứ tự với {len(first_items)} KS trang 1."
         )
     elif dom_bg and not first_items:
         status_callback(f"ℹ️ iVIVU: có {len(dom_bg)} ribbon DOM nhưng API trang 1 rỗng.")
