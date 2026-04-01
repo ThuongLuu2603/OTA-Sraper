@@ -59,6 +59,8 @@ _AGODA_HELP_RADIO = (
     "Lần đầu chọn Đầy đủ."
 )
 _AGODA_DEFAULT_UPDATE_PAGES = 5
+_AGODA_PENDING_SYNC_PAGES_KEY = "_agoda_pending_sync_pages_url"
+_AGODA_RERUN_FOR_N_PAGES_KEY = "_agoda_rerun_for_n_pages"
 
 
 def _agoda_url_for_cache_key() -> str:
@@ -267,9 +269,9 @@ def _apply_agoda_meta_to_update_pages_hint() -> None:
     st.session_state["_agoda_n_applied_mts"] = mts
 
 
-def _sync_agoda_update_pages_after_scrape(active_url: str) -> None:
-    """Ngay sau scrape Agoda thành công: đọc meta vừa ghi để N trang khớp lần chạy."""
-    u = (active_url or "").strip()
+def _apply_agoda_update_pages_from_scrape_meta(url: str) -> None:
+    """Đọc meta DB và gán `agoda_update_pages` — chỉ gọi trước khi mount widget number_input."""
+    u = (url or "").strip()
     if not u:
         return
     dk = destination_key_from_agoda_url(u)
@@ -278,10 +280,31 @@ def _sync_agoda_update_pages_after_scrape(active_url: str) -> None:
         return
     mts = float(mh.get("updated_at") or 0)
     ps = int(mh.get("pages_scanned") or 0)
+    if ps < 1:
+        ps = int(mh.get("listing_pages") or 0)
     if ps >= 1:
         st.session_state["agoda_update_pages"] = min(80, max(1, ps))
     st.session_state["_agoda_n_applied_dk"] = dk
     st.session_state["_agoda_n_applied_mts"] = mts
+
+
+def _flush_pending_agoda_update_pages_sync() -> None:
+    """Áp dụng URL đã xếp hàng sau scrape (chạy đầu app, trước UI Agoda)."""
+    u = st.session_state.pop(_AGODA_PENDING_SYNC_PAGES_KEY, None)
+    if u:
+        _apply_agoda_update_pages_from_scrape_meta(str(u).strip())
+
+
+def _queue_agoda_update_pages_sync_from_meta(active_url: str) -> None:
+    """
+    Sau scrape: không được gán `agoda_update_pages` ở đây (widget đã mount).
+    Xếp hàng + bật rerun cuối khối scrape để lượt sau flush trước widget.
+    """
+    u = (active_url or "").strip()
+    if not u:
+        return
+    st.session_state[_AGODA_PENDING_SYNC_PAGES_KEY] = u
+    st.session_state[_AGODA_RERUN_FOR_N_PAGES_KEY] = True
 
 
 _HOTEL_ID_GEO_KEYS = frozenset(
@@ -820,6 +843,8 @@ for key, default in [
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+_flush_pending_agoda_update_pages_sync()
 
 DB_CFG_OK, DB_INFO = db_ready()
 # init_db() mở kết nối + DDL — chỉ chạy một lần sau khi cấu hình DB đúng (mỗi phiên Streamlit).
@@ -1974,7 +1999,7 @@ if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
                     )
                     _agoda_scrape_ok = True
                 if _agoda_scrape_ok and st.session_state.get("scrape_results"):
-                    _sync_agoda_update_pages_after_scrape(active_url)
+                    _queue_agoda_update_pages_sync_from_meta(active_url)
             elif active_source == "Trip.com":
                 raw_results = run_scrape_tripcom(url=active_url, destination=active_destination, status_callback=update_status)
                 st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)
@@ -2069,6 +2094,9 @@ if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
         st.success(f"✅  Hoàn tất! Đã thu thập **{len(results)}** {unit} từ {active_source}.")
     else:
         st.warning(f"⚠️  Không tìm thấy dữ liệu. Hãy thử lại hoặc chọn điểm đến khác.")
+
+    if st.session_state.pop(_AGODA_RERUN_FOR_N_PAGES_KEY, None):
+        st.rerun()
 
 # ── Results ──────────────────────────────────────────────────────────────────
 if (not compare_tool_mode) and st.session_state.scrape_results:

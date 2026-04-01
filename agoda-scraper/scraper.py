@@ -1639,6 +1639,31 @@ async def click_next_page(page) -> bool:
     return False
 
 
+async def _agoda_click_next_with_retries(
+    page,
+    *,
+    fast: bool,
+    status_callback,
+) -> bool:
+    """
+    Chuyển sang trang listing kế. Không scroll lên đầu trước Next — Agoda hay tắt Next khi
+    thanh phân trang không trong viewport. Thử lặp + kéo tới footer phân trang.
+    """
+    n_try = 4 if fast else 5
+    for k in range(n_try):
+        await scroll_pagination_into_view(page)
+        await asyncio.sleep(
+            (0.26 + 0.14 * k) if fast else (0.42 + 0.22 * k)
+        )
+        if await click_next_page(page):
+            return True
+        if status_callback and k + 1 < n_try:
+            status_callback(
+                f"Next chưa bấm được (lần {k + 1}/{n_try}), kéo lại phân trang và thử tiếp…"
+            )
+    return False
+
+
 async def _poll_first_city_search(gql_queue: asyncio.Queue, page, status_callback, max_wait: float = 75.0):
     """
     Chờ gói GraphQL đầu tiên. Một nhịp 15s rồi các nhịp ngắn + scroll để nhanh hơn khi mạng tốt.
@@ -2288,13 +2313,23 @@ async def scrape_agoda(
                         )
                     break
 
-                # Navigate to next page
-                await page.evaluate("window.scrollTo(0, 0)")
-                await asyncio.sleep(0.22 if _agoda_update_fast else 0.35)
-                moved = await click_next_page(page)
+                # Navigate to next page (không scroll đầu trang — dễ làm Next disabled trên Agoda)
+                moved = await _agoda_click_next_with_retries(
+                    page,
+                    fast=_agoda_update_fast,
+                    status_callback=status_callback,
+                )
                 if not moved:
                     if status_callback:
-                        status_callback("Không bấm được Next. Dừng.")
+                        if current_page < total_pages:
+                            status_callback(
+                                f"⚠️ Không bấm được Next ở trang {current_page}/{total_pages}. "
+                                "Giao diện Agoda có thể đã hết trang trong khi API/DOM lúc đầu báo "
+                                f"{total_pages} trang (lệch tổng). Đã gom {len(results)} dòng — "
+                                "có thể thử chạy lại hoặc kiểm tra bộ lọc URL."
+                            )
+                        else:
+                            status_callback("Không bấm được Next. Dừng.")
                     break
 
                 current_page += 1
