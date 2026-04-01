@@ -6,6 +6,11 @@ import re
 import traceback
 from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse
 from datetime import date, timedelta
+from agoda_cache_db import (
+    destination_key_from_agoda_url,
+    get_destination_full_meta,
+    load_cache_map,
+)
 from scraper import build_agoda_url, run_scrape
 from scraper_tripcom import build_tripcom_url, resolve_trip_city, run_scrape_tripcom
 from scraper_mytour import build_mytour_url, resolve_mytour_city, run_scrape_mytour
@@ -45,6 +50,30 @@ def _sanitize_df_for_openpyxl(df: pd.DataFrame) -> pd.DataFrame:
                 lambda x: _sanitize_str_for_openpyxl(x) if isinstance(x, str) else x
             )
     return out
+
+
+_AGODA_RUN_FULL = "Thu thập đầy đủ"
+_AGODA_RUN_UPDATE = "Cập nhật từ cache"
+_AGODA_HELP_RADIO = (
+    "Đầy đủ: quét hết trang và lưu cache. Cập nhật: chỉ N trang đầu (giá live), phần còn lại từ cache. "
+    "Lần đầu chọn Đầy đủ."
+)
+_AGODA_DEFAULT_UPDATE_PAGES = 5
+
+
+def _agoda_url_for_cache_key() -> str:
+    u = (st.session_state.get("active_url") or "").strip()
+    if u:
+        return u
+    paste = (st.session_state.get("agoda_url") or "").strip()
+    return normalize_agoda_direct_url(paste) if paste else ""
+
+
+def _agoda_scrape_params_from_session() -> tuple[str, int]:
+    mode_label = st.session_state.get("agoda_run_mode", _AGODA_RUN_FULL)
+    if mode_label == _AGODA_RUN_UPDATE:
+        return "update", max(1, int(st.session_state.get("agoda_update_pages", 5)))
+    return "full", 0
 
 
 st.set_page_config(
@@ -151,6 +180,108 @@ def normalize_agoda_direct_url(raw_url: str) -> str:
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
     except Exception:
         return raw_url.strip()
+
+
+def _agoda_effective_url_for_meta_hint() -> str:
+    """
+    URL để suy ra destination_key khi gợi ý N trang: ưu tiên URL dán → form → lần chạy gần nhất.
+    """
+    paste = (st.session_state.get("agoda_url") or "").strip()
+    if paste:
+        return normalize_agoda_direct_url(paste)
+    dest = (st.session_state.get("agoda_dest") or "").strip()
+    if dest:
+        try:
+            ci = st.session_state.get("agoda_checkin")
+            co = st.session_state.get("agoda_checkout")
+            if ci and co and ci < co:
+                nr = int(st.session_state.get("agoda_rooms") or 1)
+                na = int(st.session_state.get("agoda_adults") or 2)
+                nc = int(st.session_state.get("agoda_children") or 0)
+                ages: list[int] = []
+                for i in range(max(0, nc)):
+                    ages.append(int(st.session_state.get(f"agoda_age_{i}", 5)))
+                return build_agoda_url(
+                    destination=dest,
+                    check_in=ci.strftime("%Y-%m-%d"),
+                    check_out=co.strftime("%Y-%m-%d"),
+                    rooms=max(1, nr),
+                    adults=max(1, na),
+                    children=max(0, nc),
+                    child_ages=ages,
+                )
+        except Exception:
+            pass
+    au = (st.session_state.get("active_url") or "").strip()
+    return normalize_agoda_direct_url(au) if au else ""
+
+
+def _apply_agoda_meta_to_update_pages_hint() -> None:
+    """
+    Gán N trang theo destination_key suy ra từ URL/form hiện tại.
+
+    - Đổi đích (khác destination_key): lấy pages_scanned từ meta nếu có; không có thì về mặc định.
+      (Trước đây `if not meta: return` khiến N và stamp không đổi — vẫn “dính” đích cũ.)
+    - Cùng đích: chỉ cập nhật N khi meta trong DB mới hơn (sau lần scrape).
+    """
+    agu = _agoda_effective_url_for_meta_hint()
+    if not agu:
+        return
+    dk = destination_key_from_agoda_url(agu)
+    if not dk or dk in ("agoda|empty", "agoda|invalid"):
+        return
+
+    prev_dk = st.session_state.get("_agoda_n_applied_dk")
+    mh = get_destination_full_meta(dk)
+
+    def _n_from_meta(m: dict | None) -> int:
+        if not m:
+            return 0
+        ps = int(m.get("pages_scanned") or 0)
+        if ps >= 1:
+            return ps
+        lp = int(m.get("listing_pages") or 0)
+        return lp if lp >= 1 else 0
+
+    if dk != prev_dk:
+        n = _n_from_meta(mh)
+        if n >= 1:
+            st.session_state["agoda_update_pages"] = min(80, max(1, n))
+        else:
+            st.session_state["agoda_update_pages"] = _AGODA_DEFAULT_UPDATE_PAGES
+        st.session_state["_agoda_n_applied_dk"] = dk
+        st.session_state["_agoda_n_applied_mts"] = (
+            float(mh.get("updated_at") or 0) if mh else 0.0
+        )
+        return
+
+    if not mh:
+        return
+    mts = float(mh.get("updated_at") or 0)
+    prev_ts = float(st.session_state.get("_agoda_n_applied_mts") or 0)
+    if mts <= prev_ts:
+        return
+    n = _n_from_meta(mh)
+    if n >= 1:
+        st.session_state["agoda_update_pages"] = min(80, max(1, n))
+    st.session_state["_agoda_n_applied_mts"] = mts
+
+
+def _sync_agoda_update_pages_after_scrape(active_url: str) -> None:
+    """Ngay sau scrape Agoda thành công: đọc meta vừa ghi để N trang khớp lần chạy."""
+    u = (active_url or "").strip()
+    if not u:
+        return
+    dk = destination_key_from_agoda_url(u)
+    mh = get_destination_full_meta(dk)
+    if not mh:
+        return
+    mts = float(mh.get("updated_at") or 0)
+    ps = int(mh.get("pages_scanned") or 0)
+    if ps >= 1:
+        st.session_state["agoda_update_pages"] = min(80, max(1, ps))
+    st.session_state["_agoda_n_applied_dk"] = dk
+    st.session_state["_agoda_n_applied_mts"] = mts
 
 
 _HOTEL_ID_GEO_KEYS = frozenset(
@@ -683,6 +814,7 @@ for key, default in [
     ("global_compare_df", None),
     ("trigger_scrape", False), ("trip_city_info", None),
     ("agoda_visible_browser", False),
+    ("agoda_update_pages", 5),
     ("mytour_city_info", None),     ("check_in_str", ""), ("check_out_str", ""),
     ("hotel_compare_on", False),
 ]:
@@ -978,12 +1110,72 @@ elif segment_name == "Tour":
                 })
 
 # ── AGODA ────────────────────────────────────────────────────────────────────
+# UI tối giản; giải thích dài nằm trong help= (tooltip). Meta trang/cache: agoda_destination_meta + scraper.
 elif ota_name == "Agoda":
-    st.checkbox(
-        "Hiện cửa sổ trình duyệt khi scrape (khuyến nghị nếu giá không khớp giá đỏ trên Agoda)",
-        key="agoda_visible_browser",
-        help="Chrome không headless. Nhiều phiên bản Agoda chỉ hiển thị đúng giá sau coupon khi có cửa sổ thật.",
-    )
+    if not st.session_state.get("_agoda_ui_migrated_v2"):
+        oc = st.session_state.get("agoda_cache_select")
+        if oc in ("N trang + phần còn cache", "Nhanh (giới hạn trang + cache)"):
+            st.session_state["agoda_run_mode"] = _AGODA_RUN_UPDATE
+        elif oc in ("Tắt", "Đủ trang — giá từ web", "Đầy đủ (lưu + ghép tĩnh)"):
+            st.session_state["agoda_run_mode"] = _AGODA_RUN_FULL
+        qp = st.session_state.get("agoda_quick_pages")
+        if qp is not None:
+            st.session_state["agoda_update_pages"] = int(qp)
+        st.session_state["_agoda_ui_migrated_v2"] = True
+
+    _rm = st.session_state.get("agoda_run_mode")
+    if _rm == "Thu thập đầy đủ — mọi trang, giá live":
+        st.session_state["agoda_run_mode"] = _AGODA_RUN_FULL
+    elif isinstance(_rm, str) and _rm.startswith("Cập nhật từ cache —"):
+        st.session_state["agoda_run_mode"] = _AGODA_RUN_UPDATE
+    if "agoda_run_mode" not in st.session_state:
+        st.session_state["agoda_run_mode"] = _AGODA_RUN_FULL
+
+    _apply_agoda_meta_to_update_pages_hint()
+
+    st.markdown("<div class='section-label'>Agoda</div>", unsafe_allow_html=True)
+    _agoda_update_on = st.session_state.get("agoda_run_mode") == _AGODA_RUN_UPDATE
+    _ac1, _ac2, _ac3 = st.columns([1.0, 2.35, 0.95], vertical_alignment="center")
+    with _ac1:
+        st.checkbox(
+            "Mở Chrome khi chạy",
+            key="agoda_visible_browser",
+            help="Bật nếu giá trong bảng lệch so với giá đỏ trên Agoda (thường do headless).",
+        )
+    with _ac2:
+        # Một hàng: nhãn + checkbox help (tooltip giống Chrome) + segmented (nhãn widget ẩn — tránh xuống dòng).
+        _cr, _cq, _cs = st.columns([0.12, 0.07, 0.81], vertical_alignment="center")
+        with _cr:
+            st.markdown("Chế độ")
+        with _cq:
+            st.checkbox(
+                " ",
+                key="agoda_mode_help_anchor",
+                label_visibility="collapsed",
+                help=_AGODA_HELP_RADIO,
+                disabled=True,
+            )
+        with _cs:
+            st.segmented_control(
+                "agoda_run_mode_ui",
+                options=[_AGODA_RUN_FULL, _AGODA_RUN_UPDATE],
+                key="agoda_run_mode",
+                label_visibility="collapsed",
+            )
+    with _ac3:
+        # Luôn mount widget → giữ session_state khi đổi Thu thập đầy đủ / Cập nhật (trước đây unmount làm mất N).
+        st.number_input(
+            "N trang",
+            min_value=1,
+            max_value=80,
+            key="agoda_update_pages",
+            disabled=not _agoda_update_on,
+            help=(
+                "Chỉ các trang này lấy giá live; KS nằm ngoài phạm vi vẫn dùng bản cache."
+                if _agoda_update_on
+                else None
+            ),
+        )
     tab1, tab2 = st.tabs(["📋  Nhập cấu hình", "🔗  Dán URL trực tiếp"])
 
     with tab1:
@@ -1745,13 +1937,44 @@ if (not compare_tool_mode) and st.session_state.get("trigger_scrape"):
                     raise ValueError(f"Nguồn tour chưa hỗ trợ: {active_source}")
                 st.session_state.scrape_results = results
             elif active_source == "Agoda":
-                raw_results = run_scrape(
-                    url=active_url,
-                    destination=active_destination,
-                    status_callback=update_status,
-                    visible_browser=st.session_state.get("agoda_visible_browser", False),
-                )
-                st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)
+                _ac_mode, _ac_upd_n = _agoda_scrape_params_from_session()
+                _agoda_scrape_ok = False
+                if _ac_mode == "update":
+                    _ck = destination_key_from_agoda_url(active_url)
+                    if len(load_cache_map(_ck)) == 0:
+                        st.error(
+                            "Chưa có cache Agoda cho URL này. "
+                            f"Chọn **{_AGODA_RUN_FULL}** một lần trước, rồi mới dùng cập nhật."
+                        )
+                        st.session_state.scrape_results = None
+                    else:
+                        raw_results = run_scrape(
+                            url=active_url,
+                            destination=active_destination,
+                            status_callback=update_status,
+                            visible_browser=st.session_state.get("agoda_visible_browser", False),
+                            agoda_cache_mode="update",
+                            agoda_update_max_pages=_ac_upd_n,
+                        )
+                        st.session_state.scrape_results = normalize_hotel_rows(
+                            raw_results, source=active_source, destination=active_destination
+                        )
+                        _agoda_scrape_ok = True
+                else:
+                    raw_results = run_scrape(
+                        url=active_url,
+                        destination=active_destination,
+                        status_callback=update_status,
+                        visible_browser=st.session_state.get("agoda_visible_browser", False),
+                        agoda_cache_mode="full",
+                        agoda_update_max_pages=0,
+                    )
+                    st.session_state.scrape_results = normalize_hotel_rows(
+                        raw_results, source=active_source, destination=active_destination
+                    )
+                    _agoda_scrape_ok = True
+                if _agoda_scrape_ok and st.session_state.get("scrape_results"):
+                    _sync_agoda_update_pages_after_scrape(active_url)
             elif active_source == "Trip.com":
                 raw_results = run_scrape_tripcom(url=active_url, destination=active_destination, status_callback=update_status)
                 st.session_state.scrape_results = normalize_hotel_rows(raw_results, source=active_source, destination=active_destination)

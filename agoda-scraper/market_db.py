@@ -296,6 +296,72 @@ def get_conn():
     return psycopg2.connect(**kw)
 
 
+def ensure_agoda_channel_cache_tables(conn) -> None:
+    """Bảng cache kênh Agoda trên Postgres (Supabase). Idempotent + migrate tên cột meta cũ."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agoda_channel_hotel (
+                destination_key TEXT NOT NULL,
+                property_id TEXT NOT NULL,
+                case_fingerprint TEXT NOT NULL,
+                row_json JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (destination_key, property_id)
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agoda_ch_hotel_dest ON agoda_channel_hotel(destination_key)"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agoda_channel_destination_meta (
+                destination_key TEXT PRIMARY KEY,
+                last_run_pages_scanned INTEGER NOT NULL,
+                last_run_listing_pages INTEGER NOT NULL,
+                last_run_hotels INTEGER NOT NULL,
+                last_run_mode TEXT NOT NULL DEFAULT 'full',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            DO $m$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'agoda_channel_destination_meta'
+                  AND column_name = 'last_full_pages_scanned'
+              ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'agoda_channel_destination_meta'
+                  AND column_name = 'last_run_pages_scanned'
+              ) THEN
+                ALTER TABLE public.agoda_channel_destination_meta
+                  RENAME COLUMN last_full_pages_scanned TO last_run_pages_scanned;
+                ALTER TABLE public.agoda_channel_destination_meta
+                  RENAME COLUMN last_full_listing_pages TO last_run_listing_pages;
+                ALTER TABLE public.agoda_channel_destination_meta
+                  RENAME COLUMN last_full_hotels TO last_run_hotels;
+              END IF;
+              IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'agoda_channel_destination_meta'
+              ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'agoda_channel_destination_meta'
+                  AND column_name = 'last_run_mode'
+              ) THEN
+                ALTER TABLE public.agoda_channel_destination_meta
+                  ADD COLUMN last_run_mode TEXT NOT NULL DEFAULT 'full';
+              END IF;
+            END $m$
+            """
+        )
+
+
 def init_db() -> tuple[bool, str]:
     ok, msg = db_ready()
     if not ok:
@@ -378,6 +444,7 @@ def init_db() -> tuple[bool, str]:
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tour_snapshot_case ON tour_snapshot(case_key)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tour_snapshot_case_source ON tour_snapshot(case_key, source)")
+        ensure_agoda_channel_cache_tables(conn)
         conn.commit()
         return True, msg
     except Exception as e:

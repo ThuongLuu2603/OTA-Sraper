@@ -52,4 +52,9 @@ Thumbs.db
 .streamlit/secrets.toml
 agoda-scraper/.streamlit/secrets.toml
 agoda-scraper/market_research.db
+agoda-scraper/agoda_channel_cache.sqlite
+agoda-scraper/agoda_channel_cache.sqlite-*
 agoda-scraper/__pycache__/
+
+# Local tool/browser caches (e.g. Playwright)
+.config/

@@ -10,10 +10,20 @@ import sys
 import unicodedata
 from collections import Counter
 from datetime import datetime
-from urllib.parse import parse_qs, quote, unquote_plus, urlparse
+from urllib.parse import parse_qs, quote, unquote_plus, urlencode, urlparse, urlunparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_bootstrap import ensure_playwright_chromium
 from geo_extract import scan_json_for_latlng
+
+from agoda_cache_db import (
+    case_fingerprint_from_agoda_url,
+    destination_key_from_agoda_url,
+    load_cache_map,
+    merge_agoda_static_from_cache,
+    row_property_id,
+    upsert_agoda_rows,
+    upsert_destination_run_meta,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +132,52 @@ def build_agoda_url(
     if children > 0 and child_ages:
         params += f"&childAges={','.join(str(a) for a in child_ages[:children])}"
     return AGODA_SEARCH_BASE + params
+
+
+def _agoda_listing_page_query_key() -> str:
+    """Tên query param phân trang listing (mặc định page). Thử AGODA_LISTING_PAGE_PARAM nếu Agoda đổi."""
+    k = (os.environ.get("AGODA_LISTING_PAGE_PARAM") or "page").strip()
+    return k if k else "page"
+
+
+def _agoda_listing_page_try_keys() -> list[str]:
+    """
+    Khi probe trang 2: thử lần lượt các tên param (Agoda hay đổi).
+    AGODA_LISTING_PAGE_TRY=page,currentPage,... hoặc chỉ định một param qua AGODA_LISTING_PAGE_PARAM.
+    """
+    raw = (os.environ.get("AGODA_LISTING_PAGE_TRY") or "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    single = (os.environ.get("AGODA_LISTING_PAGE_PARAM") or "").strip()
+    if single:
+        return [single]
+    return ["page", "currentPage", "pageNumber"]
+
+
+def _agoda_parallel_tabs() -> int:
+    """Số tab tải song song cho trang 3+ (sau khi probe trang 2). Mặc định 1 = như cũ."""
+    try:
+        n = int((os.environ.get("AGODA_PARALLEL_TABS") or "1").strip())
+    except ValueError:
+        n = 1
+    return max(1, min(8, n))
+
+
+def _agoda_url_set_listing_page(
+    url: str, page_num: int, *, query_key: str | None = None
+) -> str:
+    """Gắn / gỡ param phân trang trên URL tìm kiếm Agoda (trang 1 = bỏ param đó)."""
+    parsed = urlparse(url)
+    q = parse_qs(parsed.query, keep_blank_values=True)
+    key = query_key or _agoda_listing_page_query_key()
+    if page_num <= 1:
+        q.pop(key, None)
+    else:
+        q[key] = [str(int(page_num))]
+    new_query = urlencode(q, doseq=True)
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1651,6 +1707,212 @@ def _max_total_pages_from_nodes(nodes: list, dom_pages: int) -> int:
     return m
 
 
+def _agoda_merge_result_rows_into(
+    results: list,
+    pid_to_result_index: dict[str, int],
+    new_rows: list[dict],
+) -> None:
+    """Gộp các dòng đã parse (cùng logic dedupe với vòng lặp chính)."""
+    for record in new_rows:
+        if not record:
+            continue
+        pid_key = row_property_id(record)
+        if not pid_key:
+            results.append(record)
+            continue
+        if pid_key in pid_to_result_index:
+            idx = pid_to_result_index[pid_key]
+            results[idx] = _agoda_merge_cheaper_inclusive_row(results[idx], record)
+        else:
+            pid_to_result_index[pid_key] = len(results)
+            results.append(record)
+
+
+async def _agoda_collect_records_from_listing_url(
+    context,
+    url: str,
+    destination: str,
+    hotel_name_q: str,
+    cache_map: dict | None,
+    agoda_cache_mode: str,
+    _agoda_update_fast: bool,
+    status_callback,
+    page_label: str = "",
+    *,
+    dom_prices: bool = True,
+) -> list[dict]:
+    """
+    Một tab: goto URL listing (có thể &page=N), bắt GraphQL, tùy chọn đọc giá DOM, trả về các dòng kết quả.
+    dom_prices=False: chỉ GraphQL (dùng khi probe nhanh nhiều tên param).
+    """
+    page = await context.new_page()
+    await page.route("**/*", _agoda_route_skip_heavy_assets)
+    gql_queue: asyncio.Queue = asyncio.Queue()
+
+    async def on_response(response):
+        ct = (response.headers.get("content-type") or "").lower()
+        if "json" not in ct:
+            return
+        try:
+            body = await response.text()
+            if "citySearch" not in body:
+                return
+            data = json.loads(body)
+            nodes = _collect_city_search_nodes(data)
+            for node in nodes:
+                await gql_queue.put(node)
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    rows: list[dict] = []
+    try:
+        for goto_try in range(1, 4):
+            try:
+                await page.goto(url, wait_until="load", timeout=90000)
+                break
+            except PlaywrightTimeoutError:
+                if status_callback and page_label:
+                    status_callback(f"{page_label}: goto chậm ({goto_try}/3)…")
+                if goto_try >= 3:
+                    raise
+                await asyncio.sleep(2.0)
+        try:
+            await page.wait_for_load_state("load", timeout=25000)
+        except Exception:
+            pass
+        try:
+            await page.wait_for_load_state("networkidle", timeout=22000)
+        except Exception:
+            pass
+        await asyncio.sleep(
+            (1.25 if _agoda_update_fast else 2.0)
+            if not dom_prices
+            else (2.35 if _agoda_update_fast else 6.0)
+        )
+
+        try:
+            first_node = await _poll_first_city_search(
+                gql_queue,
+                page,
+                status_callback,
+                max_wait=(28.0 if not dom_prices else (58.0 if _agoda_update_fast else 75.0)),
+            )
+        except asyncio.TimeoutError:
+            return []
+
+        first_batch = [first_node] + await _collect_extra_city_searches(
+            gql_queue,
+            settle=(0.35 if not dom_prices else (0.7 if _agoda_update_fast else 1.5)),
+        )
+        properties = _properties_from_city_search_nodes(first_batch)
+
+        ui_shown_vnd: dict[str, float] = {}
+        ui_name_price: float | None = None
+        if dom_prices:
+            try:
+                try:
+                    await page.wait_for_selector(
+                        '[data-property-id],[data-selenium="search-web-accommodation-card"]',
+                        timeout=19000 if _agoda_update_fast else 28000,
+                    )
+                except Exception:
+                    pass
+                _n_scroll = 2 if _agoda_update_fast else 4
+                _scroll_sleep = 0.32 if _agoda_update_fast else 0.55
+                for _ in range(_n_scroll):
+                    await page.evaluate(
+                        "() => window.scrollTo(0, document.body.scrollHeight)"
+                    )
+                    await asyncio.sleep(_scroll_sleep)
+                await page.evaluate("() => window.scrollTo(0, 0)")
+                await asyncio.sleep(0.28 if _agoda_update_fast else 0.45)
+                ui_shown_vnd = await _agoda_ui_shown_price_vnd_by_property_id(page)
+            except Exception:
+                ui_shown_vnd = {}
+
+            if hotel_name_q:
+                try:
+                    ui_name_price = await _agoda_ui_price_for_hotel_name_query(
+                        page, hotel_name_q
+                    )
+                except Exception:
+                    ui_name_price = None
+
+        for hotel in properties:
+            pid_key = _agoda_property_id_from_hotel(hotel)
+            record = parse_hotel_from_graphql(
+                hotel,
+                destination,
+                ui_shown_price_vnd_by_property_id=ui_shown_vnd or None,
+                ui_name_filter_price_vnd=ui_name_price,
+                ui_name_filter_query=hotel_name_q,
+            )
+            if not record:
+                continue
+            if (
+                agoda_cache_mode in ("full", "update")
+                and cache_map
+                and pid_key
+                and pid_key in cache_map
+            ):
+                record = merge_agoda_static_from_cache(cache_map[pid_key], record)
+            rows.append(record)
+    finally:
+        await page.close()
+    return rows
+
+
+async def _agoda_probe_parallel_listing(
+    context,
+    base_url: str,
+    page1_pids: set[str],
+    destination: str,
+    hotel_name_q: str,
+    cache_map: dict | None,
+    agoda_cache_mode: str,
+    _agoda_update_fast: bool,
+    status_callback,
+) -> tuple[bool, list[dict], str | None]:
+    """
+    Tải trang listing 2 qua URL param. Trả (True, rows, query_key) nếu tập propertyId khác hẳn trang 1.
+    Thử nhiều tên param (_agoda_listing_page_try_keys).
+    """
+    if status_callback:
+        status_callback("🔎 Thử phân trang qua URL (trang 2) để bật tải song song…")
+    for qk in _agoda_listing_page_try_keys():
+        u2 = _agoda_url_set_listing_page(base_url, 2, query_key=qk)
+        rows = await _agoda_collect_records_from_listing_url(
+            context,
+            u2,
+            destination,
+            hotel_name_q,
+            cache_map,
+            agoda_cache_mode,
+            _agoda_update_fast,
+            status_callback,
+            page_label=f"Probe trang 2 ({qk})",
+            dom_prices=False,
+        )
+        pids = {row_property_id(r) for r in rows if row_property_id(r)}
+        if not rows or not pids:
+            continue
+        overlap = len(pids & page1_pids) / max(len(pids), 1)
+        if overlap > 0.42:
+            continue
+        if status_callback:
+            status_callback(
+                f"✅ Param `{qk}` phân trang ổn (trùng trang 1: {overlap:.0%}). Bật song song."
+            )
+        return True, rows, qk
+    if status_callback:
+        status_callback(
+            "⚠️ Không tìm thấy param URL phân trang hợp lệ — dùng lật trang tuần tự "
+            f"(đã thử: {', '.join(_agoda_listing_page_try_keys())})."
+        )
+    return False, [], None
+
+
 # ---------------------------------------------------------------------------
 # Main scraping engine — GraphQL interception (fast path)
 # ---------------------------------------------------------------------------
@@ -1671,12 +1933,34 @@ async def scrape_agoda(
     destination: str,
     status_callback=None,
     visible_browser: bool | None = None,
+    *,
+    agoda_cache_mode: str = "full",
+    agoda_update_max_pages: int = 0,
 ) -> list:
     """
-    Kết hợp GraphQL (intercept) + giá hiển thị trên thẻ khi cần (URL có hotelName= hoặc map id).
-    visible_browser=True: mở cửa sổ Chrome (thường cần để giá khớp UI Agoda).
+    Kết hợp GraphQL (intercept) + giá hiển thị trên thẻ (URL có hotelName= hoặc map theo property id).
+    visible_browser=True: mở cửa sổ Chrome (thường cần để giá khớp giá đỏ / sau coupon trên Agoda).
+
+    agoda_cache_mode:
+      - full: quét hết trang; load cache theo địa điểm → ghép trường tĩnh; giá từ web; lưu SQLite sau khi xong.
+      - update: chỉ quét agoda_update_max_pages trang đầu (giá live); KS còn lại nối từ cache (giá có thể cũ);
+        cần đã có cache cho destination_key (lần full trước). Nhánh update rút sleep/scroll mỗi trang (vẫn đọc giá trên thẻ).
+      Song song (env): AGODA_PARALLEL_TABS>1 — sau trang 1 probe trang 2 qua URL (thử page, currentPage, pageNumber
+        hoặc AGODA_LISTING_PAGE_TRY / AGODA_LISTING_PAGE_PARAM). Trùng KS với trang 1 → bỏ qua; khác → gom trang 3+ song song.
+      Meta destination (Supabase/SQLite): ghi sau mỗi lần chạy full hoặc update — last_run_* + last_run_mode.
     """
     results = []
+    _run_meta_pages = 0
+    _run_meta_listing_max = 0
+    _agoda_update_fast = agoda_cache_mode == "update"
+    cache_map: dict[str, dict] | None = None
+    if agoda_cache_mode in ("full", "update"):
+        cache_map = load_cache_map(destination_key_from_agoda_url(url))
+        if status_callback:
+            status_callback(
+                f"📂 Cache Agoda: {len(cache_map or {})} khách sạn đã lưu cho địa điểm này "
+                f"({'Cập nhật' if agoda_cache_mode == 'update' else 'Đầy đủ'})."
+            )
 
     async with async_playwright() as pw:
         if visible_browser is True:
@@ -1768,13 +2052,16 @@ async def scrape_agoda(
                 await page.wait_for_load_state("networkidle", timeout=22000)
             except Exception:
                 pass
-            await asyncio.sleep(6.0)
+            await asyncio.sleep(2.35 if _agoda_update_fast else 6.0)
 
             hotel_name_q = _agoda_search_hotel_name_filter(url)
 
             try:
                 first_node = await _poll_first_city_search(
-                    gql_queue, page, status_callback, max_wait=75.0
+                    gql_queue,
+                    page,
+                    status_callback,
+                    max_wait=58.0 if _agoda_update_fast else 75.0,
                 )
             except asyncio.TimeoutError:
                 if status_callback:
@@ -1782,7 +2069,9 @@ async def scrape_agoda(
                 await browser.close()
                 return results
 
-            first_batch = [first_node] + await _collect_extra_city_searches(gql_queue, settle=1.5)
+            first_batch = [first_node] + await _collect_extra_city_searches(
+                gql_queue, settle=0.7 if _agoda_update_fast else 1.5
+            )
             dom_pages = await get_total_pages(page)
             total_pages = _max_total_pages_from_nodes(first_batch, dom_pages)
             if status_callback:
@@ -1819,17 +2108,19 @@ async def scrape_agoda(
                     try:
                         await page.wait_for_selector(
                             '[data-property-id],[data-selenium="search-web-accommodation-card"]',
-                            timeout=28000,
+                            timeout=19000 if _agoda_update_fast else 28000,
                         )
                     except Exception:
                         pass
-                    for _ in range(4):
+                    _n_scroll = 2 if _agoda_update_fast else 4
+                    _scroll_sleep = 0.32 if _agoda_update_fast else 0.55
+                    for _ in range(_n_scroll):
                         await page.evaluate(
                             "() => window.scrollTo(0, document.body.scrollHeight)"
                         )
-                        await asyncio.sleep(0.55)
+                        await asyncio.sleep(_scroll_sleep)
                     await page.evaluate("() => window.scrollTo(0, 0)")
-                    await asyncio.sleep(0.45)
+                    await asyncio.sleep(0.28 if _agoda_update_fast else 0.45)
                     ui_shown_vnd = await _agoda_ui_shown_price_vnd_by_property_id(page)
                 except Exception:
                     ui_shown_vnd = {}
@@ -1842,7 +2133,7 @@ async def scrape_agoda(
                         )
                     except Exception:
                         ui_name_price = None
-                    if ui_name_price is None and hotel_name_q:
+                    if ui_name_price is None and hotel_name_q and not _agoda_update_fast:
                         if status_callback:
                             status_callback(
                                 "Chưa đọc được giá trên giao diện — chờ thêm 20s và thử lại…"
@@ -1879,6 +2170,13 @@ async def scrape_agoda(
                     )
                     if not record:
                         continue
+                    if (
+                        agoda_cache_mode in ("full", "update")
+                        and cache_map
+                        and pid_key
+                        and pid_key in cache_map
+                    ):
+                        record = merge_agoda_static_from_cache(cache_map[pid_key], record)
                     if pid_key:
                         if pid_key in pid_to_result_index:
                             idx = pid_to_result_index[pid_key]
@@ -1891,10 +2189,94 @@ async def scrape_agoda(
                     else:
                         results.append(record)
 
+                if agoda_cache_mode in ("full", "update"):
+                    _run_meta_pages = current_page
+                    _run_meta_listing_max = max(_run_meta_listing_max, total_pages)
+
+                if (
+                    agoda_cache_mode == "update"
+                    and agoda_update_max_pages > 0
+                    and current_page >= agoda_update_max_pages
+                ):
+                    if status_callback:
+                        status_callback(
+                            f"📌 Cập nhật: đã xử lý {current_page}/{agoda_update_max_pages} trang. Dừng lật trang."
+                        )
+                    break
+
                 if current_page >= 150:
                     if status_callback:
                         status_callback("⚠️ Đạt giới hạn 150 trang Agoda.")
                     break
+
+                parallel_n = _agoda_parallel_tabs()
+                if parallel_n > 1 and current_page == 1:
+                    last_listing = min(total_pages, 150)
+                    if agoda_cache_mode == "update" and agoda_update_max_pages > 0:
+                        last_listing = min(last_listing, agoda_update_max_pages)
+                    if last_listing >= 2:
+                        page1_pids = {
+                            row_property_id(r) for r in results if row_property_id(r)
+                        }
+                        ok_parallel, rows2, page_param_key = await _agoda_probe_parallel_listing(
+                            context,
+                            url,
+                            page1_pids,
+                            destination,
+                            hotel_name_q,
+                            cache_map,
+                            agoda_cache_mode,
+                            _agoda_update_fast,
+                            status_callback,
+                        )
+                        if ok_parallel and rows2 and page_param_key:
+                            _agoda_merge_result_rows_into(
+                                results, pid_to_result_index, rows2
+                            )
+                            _run_meta_pages = max(_run_meta_pages, 2)
+                            rest = list(range(3, last_listing + 1))
+                            if rest and status_callback:
+                                status_callback(
+                                    f"🚀 Tải song song tối đa {parallel_n} tab: trang "
+                                    f"{rest[0]}–{rest[-1]} (param `{page_param_key}`)…"
+                                )
+                            for j in range(0, len(rest), parallel_n):
+                                chunk = rest[j : j + parallel_n]
+                                await asyncio.sleep(random.uniform(0.06, 0.22))
+                                tasks = [
+                                    _agoda_collect_records_from_listing_url(
+                                        context,
+                                        _agoda_url_set_listing_page(
+                                            url, pn, query_key=page_param_key
+                                        ),
+                                        destination,
+                                        hotel_name_q,
+                                        cache_map,
+                                        agoda_cache_mode,
+                                        _agoda_update_fast,
+                                        status_callback,
+                                        page_label=f"Trang {pn}",
+                                    )
+                                    for pn in chunk
+                                ]
+                                outs = await asyncio.gather(*tasks, return_exceptions=True)
+                                for pn, out in zip(chunk, outs):
+                                    if isinstance(out, Exception):
+                                        if status_callback:
+                                            status_callback(
+                                                f"⚠️ Trang {pn} (song song) lỗi: {out!r}"
+                                            )
+                                        continue
+                                    _agoda_merge_result_rows_into(
+                                        results, pid_to_result_index, out
+                                    )
+                                    _run_meta_pages = max(_run_meta_pages, pn)
+                            if status_callback:
+                                status_callback(
+                                    f"✅ Đã gom song song đến trang {last_listing}. "
+                                    f"Tổng {len(results)} dòng."
+                                )
+                            break
 
                 # Phân trang Agoda render muộn: phải chờ nút Next, không coi "chưa thấy" = hết trang.
                 if not await pagination_next_available(
@@ -1908,7 +2290,7 @@ async def scrape_agoda(
 
                 # Navigate to next page
                 await page.evaluate("window.scrollTo(0, 0)")
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(0.22 if _agoda_update_fast else 0.35)
                 moved = await click_next_page(page)
                 if not moved:
                     if status_callback:
@@ -1931,7 +2313,9 @@ async def scrape_agoda(
                             status_callback(f"Không lấy được dữ liệu trang {current_page}. Dừng.")
                         break
 
-                extra_next = await _collect_extra_city_searches(gql_queue, settle=0.9)
+                extra_next = await _collect_extra_city_searches(
+                    gql_queue, settle=0.48 if _agoda_update_fast else 0.9
+                )
                 if extra_next:
                     merged_nodes = [city_search_data] + extra_next
                     total_pages = max(
@@ -1943,7 +2327,11 @@ async def scrape_agoda(
                         {"properties": combined} if combined else merged_nodes[0]
                     )
 
-                await asyncio.sleep(random.uniform(0.5, 1.2))
+                await asyncio.sleep(
+                    random.uniform(0.18, 0.45)
+                    if _agoda_update_fast
+                    else random.uniform(0.5, 1.2)
+                )
 
         except PlaywrightTimeoutError:
             if status_callback:
@@ -1954,6 +2342,39 @@ async def scrape_agoda(
         finally:
             await browser.close()
 
+    if agoda_cache_mode == "update" and agoda_update_max_pages > 0 and cache_map:
+        seen_pids = {row_property_id(r) for r in results if row_property_id(r)}
+        appended = 0
+        for pid, row in cache_map.items():
+            if pid and pid not in seen_pids:
+                results.append(dict(row))
+                appended += 1
+        if status_callback and appended:
+            status_callback(
+                f"📌 Cập nhật: nối {appended} khách sạn từ cache (ngoài {agoda_update_max_pages} trang đã quét — "
+                "giá các dòng này có thể từ lần trước)."
+            )
+
+    if agoda_cache_mode in ("full", "update"):
+        dk = destination_key_from_agoda_url(url)
+        cf = case_fingerprint_from_agoda_url(url)
+        n_saved = upsert_agoda_rows(dk, cf, results)
+        if status_callback:
+            status_callback(f"💾 Đã lưu {n_saved} bản ghi vào cache Agoda (agoda_channel_cache.sqlite).")
+        if (
+            agoda_cache_mode in ("full", "update")
+            and _run_meta_pages > 0
+            and results
+            and n_saved > 0
+        ):
+            upsert_destination_run_meta(
+                dk,
+                _run_meta_pages,
+                _run_meta_listing_max,
+                len(results),
+                "update" if agoda_cache_mode == "update" else "full",
+            )
+
     return results
 
 
@@ -1963,10 +2384,19 @@ def run_scrape(
     status_callback=None,
     *,
     visible_browser: bool | None = None,
+    agoda_cache_mode: str = "full",
+    agoda_update_max_pages: int = 0,
 ) -> list:
     """Synchronous wrapper."""
     _ensure_windows_proactor_policy()
     ensure_playwright_chromium(status_callback)
     return asyncio.run(
-        scrape_agoda(url, destination, status_callback, visible_browser=visible_browser)
+        scrape_agoda(
+            url,
+            destination,
+            status_callback,
+            visible_browser=visible_browser,
+            agoda_cache_mode=agoda_cache_mode,
+            agoda_update_max_pages=agoda_update_max_pages,
+        )
     )
