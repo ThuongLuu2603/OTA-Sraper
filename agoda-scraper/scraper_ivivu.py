@@ -135,10 +135,22 @@ def _fmt_score(point) -> str:
 
 
 def _clean_price(text: str) -> str:
+    """Đồng bộ định dạng hiển thị: xxx,xxx,xxx VND (dấu phẩy phân cách nghìn)."""
     if not text:
         return ""
     t = re.sub(r"\s+", " ", str(text)).strip()
-    if "VND" not in t.upper():
+    core = re.sub(r"\s*(?:VND|₫|[đĐ])\s*$", "", t, flags=re.I).strip()
+    core = core.replace(" ", "")
+    v: int | None = None
+    if re.fullmatch(r"\d+", core):
+        v = int(core)
+    elif re.fullmatch(r"\d{1,3}(?:\.\d{3})+", core):
+        v = int(core.replace(".", ""))
+    elif re.fullmatch(r"\d{1,3}(?:,\d{3})+", core):
+        v = int(core.replace(",", ""))
+    if v is not None and v > 0:
+        return f"{v:,} VND"
+    if not re.search(r"(?:VND|₫|[đĐ])\s*$", t, flags=re.I):
         t = f"{t} VND"
     return t
 

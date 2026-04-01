@@ -137,7 +137,7 @@ def _parse_vnd_price(text: str) -> str:
         return ""
     # The discounted (lowest) price
     price = min(nums)
-    return f"{price:,} VND".replace(',', '.')
+    return f"{price:,} VND"
 
 
 def _parse_score(text: str) -> str:
@@ -717,7 +717,7 @@ def _hotels_from_api_list(items: list, destination: str) -> list[dict]:
                      item.get("roomPrice") or 0)
         try:
             price_int = int(float(str(raw_price).replace(",", "").replace(".", "")))
-            price = f"{price_int:,.0f} VND".replace(",", ".") if price_int >= 10000 else ""
+            price = f"{price_int:,.0f} VND" if price_int >= 10000 else ""
         except Exception:
             price = ""
 
@@ -1167,7 +1167,7 @@ def _parse_hotels_from_api(data: dict, destination: str) -> list[dict]:
                          item.get("minPrice") or item.get("displayPrice") or 0)
             try:
                 price_int = int(float(str(price_val).replace(",", "")))
-                price = f"{price_int:,} VND".replace(",", ".") if price_int >= 50000 else ""
+                price = f"{price_int:,} VND" if price_int >= 50000 else ""
             except Exception:
                 price = ""
 

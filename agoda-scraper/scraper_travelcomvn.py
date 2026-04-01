@@ -193,7 +193,7 @@ def _fmt_vnd(price) -> str:
         v = float(price)
         if v <= 0:
             return ""
-        return f"{v:,.0f} VND".replace(",", ".")
+        return f"{v:,.0f} VND"
     except Exception:
         return str(price)
 

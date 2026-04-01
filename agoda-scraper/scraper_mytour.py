@@ -287,7 +287,7 @@ def _extract_hotel(item: dict, destination: str, check_in: str, check_out: str) 
 
     price = item.get("price") or item.get("basePrice")
     if price and int(price) > 0:
-        price_str = f"{int(price):,}".replace(",", ".") + " VND"
+        price_str = f"{int(price):,} VND"
     else:
         price_str = ""
 

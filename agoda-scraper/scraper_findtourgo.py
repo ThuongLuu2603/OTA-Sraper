@@ -24,10 +24,15 @@ def _to_int(v, default=0):
         return default
 
 
-def _fmt_money(v):
+def _fmt_money(v, currency: str = ""):
     try:
         n = float(v or 0)
-        return f"{n:,.0f}"
+        if n <= 0:
+            return ""
+        s = f"{n:,.0f}"
+        if (currency or "").strip().upper() == "VND":
+            return f"{s} VND"
+        return s
     except Exception:
         return ""
 
@@ -378,7 +383,7 @@ def run_scrape_findtourgo_tours(
                     "Mã tour": tour_code,
                     "Công ty lữ hành": _safe_text(agency.get("name")),
                     "Thời lượng (ngày)": _to_int(item.get("duration"), 0),
-                    "Giá từ": _fmt_money(price_val),
+                    "Giá từ": _fmt_money(price_val, price_ccy),
                     "Tiền tệ": price_ccy,
                     "Điểm đánh giá": _safe_text(score),
                     "Xếp hạng nội bộ": _safe_text(stars),
