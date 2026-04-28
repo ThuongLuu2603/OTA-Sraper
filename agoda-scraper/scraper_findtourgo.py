@@ -20,20 +20,10 @@ def _to_int(v, default=0):
     except Exception:
         return default
 
-<<<<<<< HEAD
 def _fmt_money(v):
-=======
-
-def _fmt_money(v, currency: str = ""):
->>>>>>> 96882047fb2045f46d5322949375e46a22990cda
     try:
         n = float(v or 0)
-        if n <= 0:
-            return ""
-        s = f"{n:,.0f}"
-        if (currency or "").strip().upper() == "VND":
-            return f"{s} VND"
-        return s
+        return f"{n:,.0f}"
     except Exception:
         return ""
 
@@ -350,7 +340,7 @@ def _scrape_single_country(
                     "Mã tour": tour_code,
                     "Công ty lữ hành": _safe_text(agency.get("name")),
                     "Thời lượng (ngày)": _to_int(item.get("duration"), 0),
-                    "Giá từ": _fmt_money(price_val, price_ccy),
+                    "Giá từ": _fmt_money(price_val),
                     "Tiền tệ": price_ccy,
                     "Điểm đánh giá": _safe_text(score),
                     "Xếp hạng nội bộ": _safe_text(stars),
