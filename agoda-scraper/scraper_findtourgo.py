@@ -2,20 +2,17 @@ import math
 import re
 from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlparse
-
+import concurrent.futures
 import requests
-
 
 BASE_SITE = "https://findtourgo.com"
 SEARCH_API = "https://api-v2.findtourgo.com/v1/search/tours"
 DETAIL_API = "https://api-v2.findtourgo.com/v1/public/tours/{tour_code}"
 
-
 def _safe_text(v, default=""):
     if v is None:
         return default
     return str(v).strip()
-
 
 def _to_int(v, default=0):
     try:
@@ -23,14 +20,12 @@ def _to_int(v, default=0):
     except Exception:
         return default
 
-
 def _fmt_money(v):
     try:
         n = float(v or 0)
         return f"{n:,.0f}"
     except Exception:
         return ""
-
 
 def _pick_display_price(item: dict, want_currency: str) -> tuple[float | None, str]:
     """
@@ -66,7 +61,6 @@ def _pick_display_price(item: dict, want_currency: str) -> tuple[float | None, s
         pass
     return None, want
 
-
 def _build_public_tour_url(locale: str, tour_code: str, slug: str) -> str:
     locale = _safe_text(locale, "vi") or "vi"
     tour_code = _safe_text(tour_code)
@@ -77,7 +71,6 @@ def _build_public_tour_url(locale: str, tour_code: str, slug: str) -> str:
         return f"{BASE_SITE}/{locale}/tours/{tour_code}/{slug}"
     return f"{BASE_SITE}/{locale}/tours/{tour_code}"
 
-
 _WEEKDAY_VI = {
     "monday": "Thứ 2",
     "tuesday": "Thứ 3",
@@ -87,7 +80,6 @@ _WEEKDAY_VI = {
     "saturday": "Thứ 7",
     "sunday": "CN",
 }
-
 
 def _iso_to_ddmmyyyy(iso_s: str) -> str:
     """Chuẩn hóa ISO API (UTC) sang dd/mm/yyyy để không hiển thị raw timestamp."""
@@ -102,7 +94,6 @@ def _iso_to_ddmmyyyy(iso_s: str) -> str:
         pass
     return s
 
-
 def _weekdays_vi(weekdays: list) -> str:
     parts = []
     for x in weekdays or []:
@@ -112,14 +103,12 @@ def _weekdays_vi(weekdays: list) -> str:
         parts.append(_WEEKDAY_VI.get(k, k))
     return ", ".join(parts)
 
-
 def _departure_range_label(start_iso: str, end_iso: str) -> str:
     a = _iso_to_ddmmyyyy(start_iso)
     b = _iso_to_ddmmyyyy(end_iso)
     if a and b:
         return f"{a} – {b}"
     return " – ".join([x for x in [a, b] if x])
-
 
 def _extract_one_schedule_departure(sch: dict) -> str:
     """Một dòng mô tả lịch khởi hành cho một tourSchedules entry."""
@@ -156,7 +145,6 @@ def _extract_one_schedule_departure(sch: dict) -> str:
 
     return ""
 
-
 def _extract_departure_dates(detail_json: dict) -> str:
     schedules = detail_json.get("tourSchedules") or []
     pieces: list[str] = []
@@ -172,11 +160,9 @@ def _extract_departure_dates(detail_json: dict) -> str:
             ordered.append(p)
     return " | ".join(ordered)
 
-
 _ISO_TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:\d{2})"
 )
-
 
 def normalize_findtourgo_departure_display(text: str) -> str:
     """
@@ -205,7 +191,6 @@ def normalize_findtourgo_departure_display(text: str) -> str:
     )
     return out
 
-
 def _parse_country_and_dates(url: str):
     parsed = urlparse(_safe_text(url))
     q = parse_qs(parsed.query)
@@ -218,7 +203,6 @@ def _parse_country_and_dates(url: str):
     if parts and len(parts[0]) == 2:
         locale = parts[0].lower()
     return country_code, period_start, period_end, currency, locale
-
 
 def _normalize_country_code(raw: str) -> str:
     txt = _safe_text(raw).upper()
@@ -246,7 +230,6 @@ def _normalize_country_code(raw: str) -> str:
     }
     return aliases.get(letters, "")
 
-
 def build_findtourgo_url(
     country_code: str,
     tour_period_start: str,
@@ -267,54 +250,27 @@ def build_findtourgo_url(
     return f"{BASE_SITE}/{locale}/country/{country_slug}?{query}"
 
 
-def run_scrape_findtourgo_tours(
-    url: str,
-    country_code: str = "",
-    period_start: str = "",
-    period_end: str = "",
-    currency: str = "USD",
-    locale: str = "vi",
-    page_size: int = 50,
-    max_pages: int = 20,
-    status_callback=None,
+# ==========================================
+# CÁC HÀM XỬ LÝ ĐA QUỐC GIA MỚI THAY THẾ
+# ==========================================
+
+def _scrape_single_country(
+    country_code: str,
+    period_start: str,
+    period_end: str,
+    currency: str,
+    locale: str,
+    page_size: int,
+    max_pages: int,
+    status_callback
 ) -> list:
-    if status_callback is None:
-        status_callback = lambda _msg: None
-
-    url = _safe_text(url)
-    country_code = _normalize_country_code(country_code)
-    period_start = _safe_text(period_start)
-    period_end = _safe_text(period_end)
-    currency = _safe_text(currency).upper()
-    locale = _safe_text(locale).lower()
-
-    if url:
-        c2, s2, e2, cur2, loc2 = _parse_country_and_dates(url)
-        country_code = country_code or _normalize_country_code(c2)
-        period_start = period_start or s2
-        period_end = period_end or e2
-        if not currency and cur2:
-            currency = cur2
-        if not locale and loc2:
-            locale = loc2
-
-    currency = currency or "USD"
-    locale = locale or "vi"
-
-    if not country_code:
-        raise ValueError("Thiếu hoặc sai country code (where). Dùng mã 2 ký tự như CN, VN, JP...")
-    if not period_start or not period_end:
-        raise ValueError("Thiếu tourPeriodStart hoặc tourPeriodEnd.")
-
-    status_callback(f"🌐 FindTourGo: country={country_code} | {period_start} -> {period_end}")
-
+    """Hàm worker xử lý việc scrape cho MỘT quốc gia duy nhất."""
+    
     sess = requests.Session()
-    sess.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
-        }
-    )
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    })
 
     rows = []
     seen_codes = set()
@@ -332,17 +288,23 @@ def run_scrape_findtourgo_tours(
             "tourPeriodEnd": period_end,
             "locale": locale,
         }
-        r = sess.get(SEARCH_API, params=params, timeout=30)
-        r.raise_for_status()
-        payload = r.json() if r.text else {}
+        
+        try:
+            r = sess.get(SEARCH_API, params=params, timeout=30)
+            r.raise_for_status()
+            payload = r.json() if r.text else {}
+        except Exception as e:
+            status_callback(f"❌ Lỗi API khi tìm {country_code} trang {page}: {str(e)}")
+            break
 
         items = payload.get("items") or []
+        
         if total_pages is None:
             total_items = _to_int(payload.get("totalItems"), 0)
             total_pages = _to_int(payload.get("totalPage"), 0)
             if total_pages <= 0 and total_items > 0:
                 total_pages = int(math.ceil(total_items / float(page_size)))
-            status_callback(f"📊 FindTourGo: tổng ~{total_items} tour, {max(total_pages, 1)} trang")
+            status_callback(f"📊 [{country_code}] Tìm thấy ~{total_items} tour, {max(total_pages, 1)} trang")
 
         if not items:
             break
@@ -387,10 +349,74 @@ def run_scrape_findtourgo_tours(
                 }
             )
 
-        status_callback(f"📄 Trang {page + 1}: +{len(items)} item thô, tổng unique={len(rows)}")
+        status_callback(f"📄 [{country_code}] Xong trang {page + 1}/{total_pages} (+{len(items)} items)")
         page += 1
         if total_pages and page >= total_pages:
             break
 
     return rows
 
+def run_scrape_multi_findtourgo(
+    country_codes_input: str,  # Nhập chuỗi: "VN, TH, JP, SG"
+    period_start: str = "",
+    period_end: str = "",
+    currency: str = "USD",
+    locale: str = "vi",
+    page_size: int = 50,
+    max_pages: int = 20,
+    max_workers: int = 4,      # Số luồng chạy song song (tùy chỉnh)
+    status_callback=None,
+) -> list:
+    """Hàm chính điều phối việc chạy đa luồng cho nhiều quốc gia."""
+    
+    if status_callback is None:
+        status_callback = lambda _msg: None
+
+    # 1. Tiền xử lý đầu vào
+    period_start = _safe_text(period_start)
+    period_end = _safe_text(period_end)
+    currency = _safe_text(currency).upper() or "USD"
+    locale = _safe_text(locale).lower() or "vi"
+
+    if not period_start or not period_end:
+        raise ValueError("Thiếu tourPeriodStart hoặc tourPeriodEnd.")
+
+    # Tách chuỗi nhập vào thành danh sách các quốc gia hợp lệ
+    raw_codes = [c.strip() for c in _safe_text(country_codes_input).replace(";", ",").split(",")]
+    valid_country_codes = set()
+    for code in raw_codes:
+        norm = _normalize_country_code(code)
+        if norm:
+            valid_country_codes.add(norm)
+            
+    valid_country_codes = list(valid_country_codes)
+    
+    if not valid_country_codes:
+        raise ValueError("Thiếu hoặc sai country code. Vui lòng nhập mã như VN, TH, JP, CN...")
+
+    status_callback(f"🌐 Bắt đầu Scrape đa quốc gia: {valid_country_codes} | {period_start} -> {period_end} | Max Workers: {max_workers}")
+
+    all_scraped_rows = []
+
+    # 2. Chạy đa luồng bằng ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Khởi tạo các tasks
+        future_to_code = {
+            executor.submit(
+                _scrape_single_country, 
+                code, period_start, period_end, currency, locale, page_size, max_pages, status_callback
+            ): code for code in valid_country_codes
+        }
+
+        # Thu thập kết quả khi các task hoàn thành
+        for future in concurrent.futures.as_completed(future_to_code):
+            code = future_to_code[future]
+            try:
+                rows = future.result()
+                all_scraped_rows.extend(rows)
+                status_callback(f"✅ Hoàn thành [{code}]: Thu thập được {len(rows)} tours.")
+            except Exception as exc:
+                status_callback(f"❌ Lỗi nghiêm trọng ở luồng quốc gia [{code}]: {exc}")
+
+    status_callback(f"🎉 Hoàn tất quá trình! Tổng thu thập: {len(all_scraped_rows)} tours duy nhất.")
+    return all_scraped_rows
