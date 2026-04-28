@@ -18,6 +18,8 @@ import sys
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_bootstrap import ensure_playwright_chromium
 
+from geo_extract import scan_json_for_latlng
+
 # ---------------------------------------------------------------------------
 # Province ID mapping (Mytour/Tripi internal IDs, verified by API probe)
 # ---------------------------------------------------------------------------
@@ -148,6 +150,48 @@ AVAILABILITY_URL = "https://apis.tripi.vn/hotels/v3/hotels/availability"
 PAGE_SIZE = 20  # items per page
 
 
+def _normalize_mytour_paste_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return u
+    if "://mytour.vn" in u and "://www.mytour.vn" not in u:
+        u = u.replace("://mytour.vn", "://www.mytour.vn", 1)
+    return u
+
+
+async def _mytour_post_availability(page, apphash: str, referer: str, payload: dict) -> dict:
+    """POST JSON tới Tripi availability; payload đã gồm page, provinceId hoặc aliasCode."""
+    return await page.evaluate(
+        """async ({ url, apphash, referer, payload }) => {
+            try {
+                const resp = await fetch(url, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'appid': 'mytour-web',
+                        'deviceinfo': 'PC-Web',
+                        'lang': 'vi',
+                        'currency': 'VND',
+                        'countrycode': 'VN',
+                        'caid': '17',
+                        'platform': 'website',
+                        'apphash': apphash,
+                        'version': '1.0',
+                        'origin': 'https://www.mytour.vn',
+                        'referer': referer,
+                    },
+                    body: JSON.stringify(payload),
+                });
+                return await resp.json();
+            } catch (e) {
+                return { error: String(e.message || e), code: 0 };
+            }
+        }""",
+        {"url": AVAILABILITY_URL, "apphash": apphash, "referer": referer, "payload": payload},
+    )
+
+
 def _ensure_windows_proactor_policy() -> None:
     """
     Playwright requires subprocess support; force Proactor loop policy on Windows.
@@ -190,9 +234,40 @@ def build_mytour_url(city_slug: str, check_in: str, check_out: str,
 # Hotel data extraction
 # ---------------------------------------------------------------------------
 
+def _mytour_coord_str(v) -> str:
+    if v is None:
+        return ""
+    try:
+        x = float(v)
+        return f"{x:.8f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _mytour_lat_lng(item: dict) -> tuple[str, str]:
+    if not isinstance(item, dict):
+        return "", ""
+    la = item.get("latitude") or item.get("lat")
+    lo = item.get("longitude") or item.get("lng")
+    lat_s, lng_s = _mytour_coord_str(la), _mytour_coord_str(lo)
+    if lat_s and lng_s:
+        return lat_s, lng_s
+    addr = item.get("address") or {}
+    if isinstance(addr, dict):
+        la = addr.get("latitude") or addr.get("lat")
+        lo = addr.get("longitude") or addr.get("lng")
+        lat_s, lng_s = _mytour_coord_str(la), _mytour_coord_str(lo)
+        if lat_s and lng_s:
+            return lat_s, lng_s
+    if not lat_s or not lng_s:
+        lat_s, lng_s = scan_json_for_latlng(item)
+    return lat_s, lng_s
+
+
 def _extract_hotel(item: dict, destination: str, check_in: str, check_out: str) -> dict:
     hotel_id = item.get("id", "")
     name = item.get("name", "")
+    lat_s, lng_s = _mytour_lat_lng(item)
 
     addr = item.get("address") or {}
     street = addr.get("streetName") or addr.get("address") or ""
@@ -212,7 +287,7 @@ def _extract_hotel(item: dict, destination: str, check_in: str, check_out: str) 
 
     price = item.get("price") or item.get("basePrice")
     if price and int(price) > 0:
-        price_str = f"{int(price):,}".replace(",", ".") + " VND"
+        price_str = f"{int(price):,} VND"
     else:
         price_str = ""
 
@@ -231,6 +306,8 @@ def _extract_hotel(item: dict, destination: str, check_in: str, check_out: str) 
                 cancel_policy = name_tag
                 break
 
+    hid_str = str(hotel_id).strip() if hotel_id is not None else ""
+
     return {
         "Tỉnh thành / Điểm đến": destination,
         "Tên khách sạn": name,
@@ -244,6 +321,11 @@ def _extract_hotel(item: dict, destination: str, check_in: str, check_out: str) 
         "Chính sách hoàn hủy": cancel_policy,
         "Giá/đêm (VND)": price_str,
         "Link khách sạn": link,
+        "Mã Property Agoda": "",
+        "ID khách sạn Travel": "",
+        "Mã property (OTA)": hid_str,
+        "Vĩ độ": lat_s,
+        "Kinh độ": lng_s,
     }
 
 
@@ -425,7 +507,11 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
     if not chromium:
         status_callback("ℹ️ Không thấy Chromium hệ thống, dùng Chromium của Playwright.")
 
+    direct_url = _normalize_mytour_paste_url(direct_url)
+
     # Parse guest params + dates from the pasted URL
+    url_alias = ""
+    traveller_type = None
     try:
         parsed_url = urlparse(direct_url)
         params = parse_qs(parsed_url.query)
@@ -434,6 +520,10 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
         url_adults = int(params.get("adults", ["2"])[0])
         url_rooms = int(params.get("rooms", ["1"])[0])
         url_children = int(params.get("children", ["0"])[0])
+        url_alias = (params.get("aliasCode", [""])[0] or "").strip()
+        _tt = (params.get("travellerType", [""])[0] or "").strip()
+        if _tt.isdigit():
+            traveller_type = int(_tt)
     except Exception:
         url_checkin = check_in
         url_checkout = check_out
@@ -443,7 +533,7 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
     effective_checkin = url_checkin or check_in
     effective_checkout = url_checkout or check_out
 
-    discovered: dict = {}  # apphash, province_id, total
+    discovered: dict = {}  # apphash, province_id, alias_code, total
 
     async with async_playwright() as pw:
         launch_kwargs = {
@@ -465,17 +555,19 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
                 h = request.headers
                 if h.get("apphash") and "apphash" not in discovered:
                     discovered["apphash"] = h["apphash"]
-                # More robust than response parsing: provinceId often exists in request body.
-                if "province_id" not in discovered:
-                    try:
-                        body = request.post_data or ""
-                        if body:
-                            payload = _json.loads(body)
+                try:
+                    body = request.post_data or ""
+                    if body:
+                        payload = _json.loads(body)
+                        if "province_id" not in discovered:
                             pid = payload.get("provinceId") or payload.get("province_id")
                             if pid:
                                 discovered["province_id"] = int(pid)
-                    except Exception:
-                        pass
+                        ac = payload.get("aliasCode") or payload.get("alias_code")
+                        if ac and not discovered.get("alias_code"):
+                            discovered["alias_code"] = str(ac).strip()
+                except Exception:
+                    pass
 
         async def on_response(response):
             if AVAILABILITY_URL in response.url and response.status == 200 and "province_id" not in discovered:
@@ -506,61 +598,59 @@ async def _scrape_intercept_async(direct_url: str, destination: str,
         await asyncio.sleep(5)
 
         apphash = discovered.get("apphash", "LnJCWsNPd7SMjCMm7dw5BlqIeoFiib3iUTjSC6rck6Y=")
-        province_id = discovered.get("province_id")
         total_hint = discovered.get("total", 0)
+        # URL có aliasCode → luôn gọi API theo alias (vd khu td104), không dùng provinceId bắt được từ request khác.
+        if url_alias:
+            alias_code = url_alias
+            province_id = None
+        else:
+            province_id = discovered.get("province_id")
+            alias_code = (discovered.get("alias_code") or "").strip()
 
-        if not province_id:
-            status_callback("❌ Không phát hiện được province_id từ URL này. Hãy refresh trang và thử lại, hoặc dùng tab cấu hình.")
+        if province_id is None and not alias_code:
+            status_callback(
+                "❌ Không phát hiện province_id hoặc aliasCode. "
+                "Với URL /khach-san/search?aliasCode=... hãy giữ nguyên aliasCode trên URL; hoặc dùng tab cấu hình theo tỉnh/thành."
+            )
             await browser.close()
             return []
 
-        status_callback(f"✅ Phát hiện province_id={province_id}, tổng ~{total_hint} khách sạn. Bắt đầu thu thập toàn bộ...")
+        if province_id is not None:
+            status_callback(f"✅ Phát hiện province_id={province_id}, tổng ~{total_hint} KS. Thu thập…")
+        else:
+            status_callback(f"✅ Phát hiện aliasCode={alias_code}, tổng ~{total_hint or '?'} KS. Thu thập…")
 
-        # --- Paginate via direct API calls (same as _scrape_async) ---
+        # --- Paginate via direct API calls ---
         results: list[dict] = []
         seen_ids: set = set()
         total_pages = max(1, math.ceil(total_hint / PAGE_SIZE)) if total_hint else 99
         current_page = 1
 
+        def _build_payload(pg: int) -> dict:
+            p: dict = {
+                "checkIn": effective_checkin,
+                "checkOut": effective_checkout,
+                "adults": url_adults,
+                "rooms": url_rooms,
+                "children": url_children,
+                "page": pg,
+                "size": PAGE_SIZE,
+                "useBasePrice": True,
+            }
+            if province_id is not None:
+                p["provinceId"] = int(province_id)
+            else:
+                p["aliasCode"] = alias_code
+                if traveller_type is not None:
+                    p["travellerType"] = traveller_type
+            return p
+
         while current_page <= total_pages:
             status_callback(f"📄 Đang tải trang {current_page}/{total_pages if total_hint else '?'}...")
 
-            api_result = await page.evaluate(f"""async () => {{
-                try {{
-                    const resp = await fetch('{AVAILABILITY_URL}', {{
-                        method: 'POST',
-                        credentials: 'include',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'appid': 'mytour-web',
-                            'deviceinfo': 'PC-Web',
-                            'lang': 'vi',
-                            'currency': 'VND',
-                            'countrycode': 'VN',
-                            'caid': '17',
-                            'platform': 'website',
-                            'apphash': '{apphash}',
-                            'version': '1.0',
-                            'origin': 'https://www.mytour.vn',
-                            'referer': '{direct_url}'
-                        }},
-                        body: JSON.stringify({{
-                            checkIn: '{effective_checkin}',
-                            checkOut: '{effective_checkout}',
-                            adults: {url_adults},
-                            rooms: {url_rooms},
-                            children: {url_children},
-                            page: {current_page},
-                            size: {PAGE_SIZE},
-                            useBasePrice: true,
-                            provinceId: {province_id}
-                        }})
-                    }});
-                    return await resp.json();
-                }} catch(e) {{
-                    return {{error: e.message}};
-                }}
-            }}""")
+            api_result = await _mytour_post_availability(
+                page, apphash, direct_url, _build_payload(current_page)
+            )
 
             if api_result.get("error"):
                 status_callback(f"❌ Lỗi API: {api_result['error']}")

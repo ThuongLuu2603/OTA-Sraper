@@ -153,7 +153,15 @@ def _parse_card(card: dict, base_year: int) -> dict | None:
     price = ""
     m = re.search(r"Giá từ:\s*([0-9\.\,]+)", context, flags=re.I)
     if m:
-        price = _safe(m.group(1))
+        raw_p = _safe(m.group(1)).replace(" ", "")
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", raw_p):
+            price = f"{int(raw_p.replace('.', '')):,} VND"
+        elif re.fullmatch(r"\d{1,3}(?:,\d{3})+", raw_p):
+            price = f"{int(raw_p.replace(',', '')):,} VND"
+        elif raw_p.isdigit():
+            price = f"{int(raw_p):,} VND"
+        else:
+            price = _safe(m.group(1))
 
     if not head and not tour_code:
         return None

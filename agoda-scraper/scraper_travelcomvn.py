@@ -85,8 +85,7 @@ CITY_MAP: dict[str, tuple[str, int, str]] = {
 
 API_URL = "https://api2.travel.com.vn/core/Hotel/search-hotel"
 PAGE_SIZE = 20
-# Travel.com.vn list API does not expose explicit tax/fee fields.
-# Use a configurable estimate for gross price to align with "đã gồm thuế phí" display.
+# Khi API không trả gross / thuế tách → hệ số dự phòng cho cột "đã gồm thuế phí".
 TRAVEL_TAX_FEE_RATE = 0.15
 
 
@@ -194,7 +193,7 @@ def _fmt_vnd(price) -> str:
         v = float(price)
         if v <= 0:
             return ""
-        return f"{v:,.0f} VND".replace(",", ".")
+        return f"{v:,.0f} VND"
     except Exception:
         return str(price)
 
@@ -207,6 +206,109 @@ def _price_with_tax_fee(price):
         return round(v * (1 + TRAVEL_TAX_FEE_RATE))
     except Exception:
         return None
+
+
+def _travel_positive_float(val) -> float | None:
+    try:
+        x = float(val)
+        return x if x > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _travel_ci_map(d: dict) -> dict[str, object]:
+    return {str(k).lower().replace("_", ""): v for k, v in d.items()}
+
+
+def _travel_price_chunks(hotel: dict) -> list[dict]:
+    """Các dict con có thể chứa gross / thuế (tuỳ payload search-hotel)."""
+    out: list[dict] = [hotel]
+    for nk in (
+        "pricing",
+        "lowestRoom",
+        "lowestRoomInfo",
+        "room",
+        "roomInfo",
+        "rate",
+        "rates",
+        "hotelPrice",
+    ):
+        sub = hotel.get(nk)
+        if isinstance(sub, dict):
+            out.append(sub)
+        elif isinstance(sub, list):
+            for it in sub[:5]:
+                if isinstance(it, dict):
+                    out.append(it)
+    return out
+
+
+def _travel_resolve_gross_price(hotel: dict) -> tuple[float | None, float | None, str]:
+    """
+    Trả về (giá đêm hiển thị đã gồm thuế/phí, giá gốc price, ghi chú nguồn).
+
+    Thứ tự: (1) field tổng/gross rõ ràng từ API; (2) price + các khoản tax/fee tách;
+    (3) price × (1 + TRAVEL_TAX_FEE_RATE).
+
+    Payload thực tế chỉ có thể xác nhận khi bắt JSON (JWT). Các tên khóa dưới đây
+    là dự đoán phổ biến — bổ sung khi dump được mẫu từ api2.travel.com.vn.
+    """
+    base = _travel_positive_float(hotel.get("price"))
+    chunks = _travel_price_chunks(hotel)
+
+    gross_keys = (
+        "grossprice",
+        "totalprice",
+        "finalprice",
+        "totalamount",
+        "grandtotal",
+        "priceincludedvat",
+        "priceincludetax",
+        "pricewithtax",
+        "amountaftertax",
+        "sellingprice",
+        "displaytotal",
+    )
+    for ch in chunks:
+        cmap = _travel_ci_map(ch)
+        for gk in gross_keys:
+            gv = _travel_positive_float(cmap.get(gk))
+            if gv is None:
+                continue
+            if base is None:
+                return round(gv), base, f"từ API ({gk})"
+            if gv > base * 1.005:
+                return round(gv), base, f"từ API ({gk})"
+
+    tax_keys = (
+        "tax",
+        "taxamount",
+        "taxvalue",
+        "vat",
+        "vatamount",
+        "valueaddedtax",
+        "servicefee",
+        "servicecharge",
+        "processingfee",
+        "totalfee",
+        "fees",
+        "surcharge",
+    )
+    for ch in chunks:
+        cmap = _travel_ci_map(ch)
+        extra = 0.0
+        for tk in tax_keys:
+            tv = _travel_positive_float(cmap.get(tk))
+            if tv is not None:
+                extra += tv
+        if base is not None and extra > 0:
+            return round(base + extra), base, "từ API (price + thuế/phí)"
+
+    if base is not None:
+        est = _price_with_tax_fee(base)
+        return est, base, f"ước tính {int(TRAVEL_TAX_FEE_RATE * 100)}%"
+
+    return None, None, ""
 
 
 def _fmt_stars(rating) -> str:
@@ -233,6 +335,77 @@ def _fmt_score(score) -> str:
         return str(score)
 
 
+def _fmt_coord_travel(raw) -> str:
+    if raw is None:
+        return ""
+    try:
+        x = float(raw)
+        s = f"{x:.8f}".rstrip("0").rstrip(".")
+        return s
+    except (TypeError, ValueError):
+        return str(raw).strip()
+
+
+def _lat_lng_from_block(block: dict) -> tuple[str, str]:
+    if not isinstance(block, dict):
+        return "", ""
+    pairs = (
+        ("latitude", "longitude"),
+        ("lat", "lng"),
+        ("geoLatitude", "geoLongitude"),
+        ("Latitude", "Longitude"),
+    )
+    for a, b in pairs:
+        if block.get(a) is not None and block.get(b) is not None:
+            la, lo = _fmt_coord_travel(block.get(a)), _fmt_coord_travel(block.get(b))
+            if la and lo:
+                return la, lo
+    return "", ""
+
+
+def _travel_lat_lng(hotel: dict) -> tuple[str, str]:
+    la, lo = _lat_lng_from_block(hotel)
+    if la and lo:
+        return la, lo
+    for nest_key in ("location", "geoLocation", "coordinates", "mapLocation", "geo", "position"):
+        block = hotel.get(nest_key)
+        la, lo = _lat_lng_from_block(block)
+        if la and lo:
+            return la, lo
+    return "", ""
+
+
+def _travel_agoda_property_id(hotel: dict) -> str:
+    for k in (
+        "agodaPropertyId",
+        "agodaHotelId",
+        "agodaId",
+        "sourceAgodaId",
+        "agodaPropertyID",
+        "AgodaPropertyId",
+    ):
+        v = hotel.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        if s.isdigit():
+            return s
+        m = re.search(r"(\d{4,})", s)
+        if m:
+            return m.group(1)
+    hid = str(hotel.get("hotelId") or "")
+    m = re.match(r"(?i)^AGODA[_\-]?(\d+)$", hid)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _travel_hotel_id_raw(hotel: dict) -> str:
+    return str(hotel.get("hotelId") or "").strip()
+
+
 def _hotel_url(hotel: dict, city_slug: str = "") -> str:
     """Build a best-guess hotel detail URL."""
     hid = hotel.get("hotelId", "")
@@ -248,18 +421,26 @@ def _hotel_url(hotel: dict, city_slug: str = "") -> str:
 
 def _parse_hotel(hotel: dict, destination: str, city_slug: str) -> dict:
     base_price = hotel.get("price")
-    gross_price = _price_with_tax_fee(base_price)
+    gross_price, _, price_source_note = _travel_resolve_gross_price(hotel)
+    agoda_pid = _travel_agoda_property_id(hotel)
+    lat_s, lng_s = _travel_lat_lng(hotel)
+    travel_hid = _travel_hotel_id_raw(hotel)
     return {
         "Tên khách sạn": hotel.get("hotelName", ""),
         "Link khách sạn": _hotel_url(hotel, city_slug),
         "Địa chỉ": (hotel.get("address") or "").strip(),
+        "Mã Property Agoda": agoda_pid,
+        "ID khách sạn Travel": travel_hid,
+        "Mã property (OTA)": "",
+        "Vĩ độ": lat_s,
+        "Kinh độ": lng_s,
         "Hạng sao": _fmt_stars(hotel.get("starRating")),
         "Loại": hotel.get("typeTitle", ""),
         "Điểm đánh giá": _fmt_score(hotel.get("reviewScore")),
         "Số đánh giá": str(int(hotel.get("reviewCount") or 0)) if hotel.get("reviewCount") else "",
         "Giá/đêm (chưa gồm thuế phí)": _fmt_vnd(base_price),
         "Giá/đêm (VND)": _fmt_vnd(gross_price if gross_price is not None else base_price),
-        "Thuế phí ước tính": f"{int(TRAVEL_TAX_FEE_RATE * 100)}%",
+        "Thuế phí ước tính": price_source_note or f"{int(TRAVEL_TAX_FEE_RATE * 100)}%",
         "Chính sách hoàn hủy": "",
         "Nguồn": "travel.com.vn",
         "Điểm đến": destination,
@@ -379,7 +560,10 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
 
     jwt, client_id, first_resp = result
     status_callback(f"✅ Đã lấy được token xác thực")
-    status_callback("ℹ️ Giá Travel.com.vn được quy đổi sang đã gồm thuế phí theo mức ước tính 15%.")
+    status_callback(
+        "ℹ️ Giá đã gồm thuế/phí: ưu tiên field gross hoặc price+thuế từ API nếu có; "
+        f"không thì ×{1 + TRAVEL_TAX_FEE_RATE:.2f} ({int(TRAVEL_TAX_FEE_RATE * 100)}% ước tính)."
+    )
 
     # Derive city info from URL
     parsed_url = urlparse(url)
@@ -409,11 +593,21 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
     results: list[dict] = []
     seen: set[str] = set()
 
-    def _add(hotels: list[dict], city_slug: str) -> int:
+    def _add(hotels: list[dict], city_slug: str, page_idx: int = 0) -> int:
         added = 0
-        for h in hotels:
-            key = (h.get("hotelId") or h.get("hotelName") or "").lower().strip()
-            if key and key not in seen:
+        for i, h in enumerate(hotels):
+            if not isinstance(h, dict):
+                continue
+            hid = str(h.get("hotelId") or "").strip()
+            nm = str(h.get("hotelName") or "").strip().lower()
+            addr = str(h.get("address") or "").strip().lower()[:56]
+            if hid:
+                key = f"id:{hid}"
+            elif nm:
+                key = f"n:{nm}|{addr}"
+            else:
+                key = f"p{page_idx}:i{i}:{addr}"
+            if key not in seen:
                 seen.add(key)
                 results.append(_parse_hotel(h, destination, city_slug))
                 added += 1
@@ -428,59 +622,100 @@ async def _scrape_async(url: str, destination: str, status_callback) -> list[dic
             return resp
         return []
 
+    def _travel_totals(resp_json: dict) -> tuple[int, int]:
+        """
+        totalRecord / totalPage thường nằm trong response (không phải root).
+        Trả về (total_record, total_page).
+        """
+        if not isinstance(resp_json, dict):
+            return 0, 0
+        inner = resp_json.get("response")
+        tr = int(resp_json.get("totalRecord") or resp_json.get("totalRecords") or 0)
+        tp = int(resp_json.get("totalPage") or resp_json.get("totalPages") or 0)
+        if isinstance(inner, dict):
+            tr = int(inner.get("totalRecord") or inner.get("totalRecords") or tr or 0)
+            tp = int(inner.get("totalPage") or inner.get("totalPages") or tp or 0)
+        return tr, tp
+
     # Step 2: Process first response already captured
     base_payload = _url_to_payload(url, city_name_no_sign=slug, city_title=destination, page_index=1)
-    total_record = first_resp.get("totalRecord") or 0
+    total_record, total_pages_api = _travel_totals(first_resp)
     hotels_p1 = _extract_hotels(first_resp)
-    added = _add(hotels_p1, slug)
-    status_callback(f"📄 Trang 1: {len(hotels_p1)} khách sạn, tổng={total_record}")
+    added = _add(hotels_p1, slug, page_idx=1)
+    status_callback(f"📄 Trang 1: {len(hotels_p1)} khách sạn, totalRecord≈{total_record}")
 
-    # Determine total pages
-    total_pages_raw = first_resp.get("totalPage")
-    if total_pages_raw:
-        total_pages = int(total_pages_raw)
+    if total_pages_api > 0:
+        total_pages = total_pages_api
     elif total_record > 0:
         total_pages = max(1, (total_record + PAGE_SIZE - 1) // PAGE_SIZE)
     else:
         total_pages = 1
 
-    status_callback(f"📊 Tổng {total_record} khách sạn — {total_pages} trang")
+    if total_record > 0 and total_pages * PAGE_SIZE < total_record:
+        total_pages = max(total_pages, (total_record + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    need_pages = (
+        max(1, (total_record + PAGE_SIZE - 1) // PAGE_SIZE) if total_record > 0 else max(1, total_pages)
+    )
+    max_pages = min(max(total_pages, need_pages) + 25, 500)
+    status_callback(
+        f"📊 API: ~{total_record} KS, {total_pages} trang — lật tối đa {max_pages} trang"
+    )
 
     # Step 3: Pages 2+
     consecutive_empty = 0
-    for pg in range(2, min(total_pages + 1, 101)):
+    pg = 2
+    while pg <= max_pages:
         if len(results) >= 2000:
             status_callback("⚠️ Đạt giới hạn 2000.")
             break
 
-        status_callback(f"📄 Trang {pg}/{total_pages}...")
+        # Không dừng khi len >= totalRecord: API đôi khi trả totalRecord nhỏ/sai
+        # (vd. 51) khiến chỉ gom được một phần — chỉ dùng totalRecord để ước lượng max_pages.
+
+        if total_record <= 0 and pg > total_pages and consecutive_empty >= 4:
+            break
+
+        status_callback(f"📄 Trang {pg}/{total_pages} (mục tiêu ~{total_record or '?'})...")
         payload = dict(base_payload)
         payload["pageIndex"] = pg
 
         try:
-            r = sess.post(API_URL, json=payload, timeout=15)
+            r = sess.post(API_URL, json=payload, timeout=35)
             r.raise_for_status()
             resp_json = r.json()
         except Exception as e:
             status_callback(f"  ⚠️ Lỗi trang {pg}: {e}")
             consecutive_empty += 1
-            if consecutive_empty >= 3:
+            if consecutive_empty >= 5:
                 break
+            time.sleep(0.8)
+            pg += 1
             continue
 
+        tr2, tp2 = _travel_totals(resp_json)
+        if tr2 > total_record:
+            total_record = tr2
+        if tp2 > total_pages:
+            total_pages = tp2
+            max_pages = min(max(max_pages, total_pages + 25), 500)
+
         hotels_pg = _extract_hotels(resp_json)
-        added = _add(hotels_pg, slug)
+        added = _add(hotels_pg, slug, page_idx=pg)
         status_callback(f"  → +{added} mới (tổng: {len(results)})")
 
         if added > 0:
             consecutive_empty = 0
         else:
             consecutive_empty += 1
-            if consecutive_empty >= 3:
-                status_callback("⚠️ 3 trang liên tiếp không có kết quả mới, dừng.")
+            if total_record > 0 and len(results) < total_record and pg <= total_pages + 2:
+                status_callback("  ℹ️ Trang không thêm KS mới nhưng chưa đủ totalRecord — tiếp tục.")
+            elif consecutive_empty >= 5:
+                status_callback("⚠️ Nhiều trang liên tiếp không có KS mới, dừng.")
                 break
 
-        time.sleep(0.3)
+        time.sleep(0.35)
+        pg += 1
 
     status_callback(f"✅ Hoàn thành: {len(results)} khách sạn từ travel.com.vn")
     return results
