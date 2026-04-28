@@ -28,10 +28,6 @@ def _fmt_money(v):
         return ""
 
 def _pick_display_price(item: dict, want_currency: str) -> tuple[float | None, str]:
-    """
-    Giá ở cấp item thường theo item['currency'] (USD hoặc VND tùy nhà điều hành).
-    Để khớp filter currency= trên URL, lấy đúng phần tử trong item['prices'].
-    """
     want = _safe_text(want_currency).upper() or "USD"
 
     for p in item.get("prices") or []:
@@ -82,7 +78,6 @@ _WEEKDAY_VI = {
 }
 
 def _iso_to_ddmmyyyy(iso_s: str) -> str:
-    """Chuẩn hóa ISO API (UTC) sang dd/mm/yyyy để không hiển thị raw timestamp."""
     s = _safe_text(iso_s)
     if not s:
         return ""
@@ -111,7 +106,6 @@ def _departure_range_label(start_iso: str, end_iso: str) -> str:
     return " – ".join([x for x in [a, b] if x])
 
 def _extract_one_schedule_departure(sch: dict) -> str:
-    """Một dòng mô tả lịch khởi hành cho một tourSchedules entry."""
     if not isinstance(sch, dict):
         return ""
     spec = [_safe_text(x) for x in (sch.get("departureSpecifiedDates") or []) if _safe_text(x)]
@@ -124,7 +118,6 @@ def _extract_one_schedule_departure(sch: dict) -> str:
     range_txt = _departure_range_label(start_date or "", end_date or "")
     wd_vi = _weekdays_vi(sch.get("departureWeekdays") or [])
 
-    # DAILY: khoảng ngày là “có tour mỗi ngày”, không phải 2 ngày khởi hành cố định.
     if dtype == "DAILY":
         if range_txt:
             return f"Hằng ngày ({range_txt})"
@@ -165,10 +158,6 @@ _ISO_TIMESTAMP_RE = re.compile(
 )
 
 def normalize_findtourgo_departure_display(text: str) -> str:
-    """
-    Đưa cột Ngày khởi hành về dạng đọc được: thay mọi timestamp ISO trong chuỗi
-    (kể cả dữ liệu scrape cũ / nạp từ DB) sang dd/mm/yyyy; dịch thứ tiếng Anh còn sót.
-    """
     t = _safe_text(text)
     if not t or t.lower() == "nan":
         return ""
@@ -208,7 +197,6 @@ def _normalize_country_code(raw: str) -> str:
     txt = _safe_text(raw).upper()
     if not txt:
         return ""
-    # Keep only letters for robust matching.
     letters = re.sub(r"[^A-Z]", "", txt)
     if len(letters) == 2:
         return letters
@@ -250,10 +238,6 @@ def build_findtourgo_url(
     return f"{BASE_SITE}/{locale}/country/{country_slug}?{query}"
 
 
-# ==========================================
-# CÁC HÀM XỬ LÝ ĐA QUỐC GIA MỚI THAY THẾ
-# ==========================================
-
 def _scrape_single_country(
     country_code: str,
     period_start: str,
@@ -276,7 +260,8 @@ def _scrape_single_country(
     seen_codes = set()
     page = 0
     total_pages = None
-    page_size = max(10, min(_to_int(page_size, 50), 100))
+    # GIỚI HẠN MỚI: tối đa 500 tour/lần tải để có thể lấy 300 tour như bạn muốn
+    page_size = max(10, min(_to_int(page_size, 300), 1000))
     max_pages = max(1, _to_int(max_pages, 20))
 
     while page < max_pages:
@@ -357,14 +342,14 @@ def _scrape_single_country(
     return rows
 
 def run_scrape_multi_findtourgo(
-    country_codes_input: str,  # Nhập chuỗi: "VN, TH, JP, SG"
+    country_codes_input: str,
     period_start: str = "",
     period_end: str = "",
     currency: str = "USD",
     locale: str = "vi",
-    page_size: int = 50,
+    page_size: int = 300,
     max_pages: int = 20,
-    max_workers: int = 4,      # Số luồng chạy song song (tùy chỉnh)
+    max_workers: int = 4,
     status_callback=None,
 ) -> list:
     """Hàm chính điều phối việc chạy đa luồng cho nhiều quốc gia."""
@@ -372,7 +357,6 @@ def run_scrape_multi_findtourgo(
     if status_callback is None:
         status_callback = lambda _msg: None
 
-    # 1. Tiền xử lý đầu vào
     period_start = _safe_text(period_start)
     period_end = _safe_text(period_end)
     currency = _safe_text(currency).upper() or "USD"
@@ -381,7 +365,6 @@ def run_scrape_multi_findtourgo(
     if not period_start or not period_end:
         raise ValueError("Thiếu tourPeriodStart hoặc tourPeriodEnd.")
 
-    # Tách chuỗi nhập vào thành danh sách các quốc gia hợp lệ
     raw_codes = [c.strip() for c in _safe_text(country_codes_input).replace(";", ",").split(",")]
     valid_country_codes = set()
     for code in raw_codes:
@@ -398,9 +381,7 @@ def run_scrape_multi_findtourgo(
 
     all_scraped_rows = []
 
-    # 2. Chạy đa luồng bằng ThreadPoolExecutor
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Khởi tạo các tasks
         future_to_code = {
             executor.submit(
                 _scrape_single_country, 
@@ -408,7 +389,6 @@ def run_scrape_multi_findtourgo(
             ): code for code in valid_country_codes
         }
 
-        # Thu thập kết quả khi các task hoàn thành
         for future in concurrent.futures.as_completed(future_to_code):
             code = future_to_code[future]
             try:
